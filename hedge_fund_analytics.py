@@ -10,7 +10,8 @@ This file replaces three separate scripts:
                                      cluster assignments, exclusion audit.
     Module 3  Performance/drawdowns  NAV and drawdown lines plus rolling
                                      drawdown, rolling performance and
-                                     risk-adjusted-return heatmaps.
+                                     risk-adjusted-return heatmaps. Each of
+                                     those three can be turned off on its own.
 
 ===============================================================================
 EXPECTED WORKBOOK LAYOUTS
@@ -204,6 +205,9 @@ def default_settings() -> dict[str, Any]:
             "dpi": 180,
         },
         "performance": {
+            "include_nav_line_charts": True,
+            "include_drawdown_line_charts": True,
+            "include_heatmaps": True,
             "rolling_window_months": 12,
             "min_history_months": 0,
             "line_chart_window_months": 0,
@@ -327,6 +331,13 @@ def validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("Clustering: select at least one output type (PDF, PNG or CSV).")
 
     performance = settings["performance"]
+    if not any((performance["include_nav_line_charts"],
+                performance["include_drawdown_line_charts"],
+                performance["include_heatmaps"])):
+        raise ValueError(
+            "Performance: choose at least one of the NAV line charts, the drawdown "
+            "line charts or the heatmaps."
+        )
     if int(performance["rolling_window_months"]) < 1:
         raise ValueError("Performance: the rolling window must be at least 1 month.")
     for key, label in (
@@ -342,11 +353,19 @@ def validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("Performance: the line-chart format must be html or static.")
     if int(performance["dpi"]) < 72:
         raise ValueError("Performance: image resolution must be at least 72 DPI.")
-    if not any((performance["create_pdf"], performance["save_png"])) and performance["line_chart_mode"] == "static":
-        raise ValueError(
-            "Performance: static line charts need PDF or PNG output. "
-            "Tick one of those, or choose interactive HTML line charts."
-        )
+    if not any((performance["create_pdf"], performance["save_png"])):
+        # Heatmaps are only ever drawn with matplotlib, so they have nowhere to go
+        # without one of the static output types.
+        if performance["include_heatmaps"]:
+            raise ValueError(
+                "Performance: the heatmaps need PDF or PNG output. "
+                "Tick one of those, or untick the heatmaps."
+            )
+        if performance["line_chart_mode"] == "static":
+            raise ValueError(
+                "Performance: static line charts need PDF or PNG output. "
+                "Tick one of those, or choose interactive HTML line charts."
+            )
 
 
 # =============================================================================
@@ -2084,13 +2103,24 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
     heatmap_months = int(options["recent_months_heatmap"])
     wrap_width = int(options["x_label_wrap_width"])
     dpi = int(options["dpi"])
+    want_nav_lines = bool(options["include_nav_line_charts"])
+    want_drawdown_lines = bool(options["include_drawdown_line_charts"])
+    want_line_charts = want_nav_lines or want_drawdown_lines
+    want_heatmaps = bool(options["include_heatmaps"])
     want_html = options["line_chart_mode"] == "html"
     want_static = (not want_html) or options["create_pdf"] or options["save_png"]
 
-    if want_html and importlib.util.find_spec("plotly") is None:
+    if want_line_charts and want_html and importlib.util.find_spec("plotly") is None:
         want_html = False
         want_static = True
         log.append("Plotly is not installed, so static line charts were produced instead.")
+
+    chosen = [label for label, wanted in (
+        ("NAV line charts", want_nav_lines),
+        ("drawdown line charts", want_drawdown_lines),
+        ("heatmaps", want_heatmaps),
+    ) if wanted]
+    log.append("Producing: " + ", ".join(chosen) + ".")
 
     figures: list[tuple[plt.Figure, int, str]] = []
     html_files: list[str] = []
@@ -2115,13 +2145,18 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
 
     def add_line_charts(returns_by_name: dict[str, pd.Series], context: str,
                         chart_base: str, start_key: int) -> int:
-        """NAV and drawdown line charts for one strategy, or for every fund."""
+        """The chosen NAV and drawdown line charts, for one strategy or for every fund."""
         key = start_key
-        for transform, ylabel, shade, title in (
-            ("nav", f"NAV (Initial {INITIAL_PRICE_INDEX_VALUE:g})", False,
-             f"{chart_base} - NAV Comparison (Growth of {INITIAL_PRICE_INDEX_VALUE:g}) {title_suffix}"),
-            ("drawdown", "Drawdown (%)", True, f"{chart_base} - Actual Drawdowns {title_suffix}"),
-        ):
+        wanted = [
+            spec for spec, include in (
+                (("nav", f"NAV (Initial {INITIAL_PRICE_INDEX_VALUE:g})", False,
+                  f"{chart_base} - NAV Comparison (Growth of "
+                  f"{INITIAL_PRICE_INDEX_VALUE:g}) {title_suffix}"), want_nav_lines),
+                (("drawdown", "Drawdown (%)", True,
+                  f"{chart_base} - Actual Drawdowns {title_suffix}"), want_drawdown_lines),
+            ) if include
+        ]
+        for transform, ylabel, shade, title in wanted:
             frame = prepare_line_chart_data(returns_by_name, min_history, plot_window,
                                             excluded, context, transform)
             if frame is None or frame.empty:
@@ -2151,31 +2186,35 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
         for name, returns in returns_by_name.items():
             all_returns[f"{strategy} - {name}"] = returns
 
-        sort_key = add_line_charts(returns_by_name, strategy, strategy, sort_key) + 10
+        if want_line_charts:
+            sort_key = add_line_charts(returns_by_name, strategy, strategy, sort_key) + 10
 
-        frames = _performance_heatmaps(returns_by_name, options)
-        for key, chart_title, colour_label, palette, rolling, annotation in heatmap_specs:
-            frame = _tail_months(frames[key], heatmap_months)
-            if frame.empty:
-                continue
-            low, high = colormaps[f"{palette}_limits"]
-            figure = generate_heatmap_figure(
-                frame, strategy, chart_title, colour_label, colormaps[palette], low, high,
-                0.0 if palette != "drawdown" else None, rolling, wrap_width, annotation)
-            if figure is not None:
-                figures.append((figure, sort_key, f"{chart_title} Heatmap - {strategy}"))
-            sort_key += 1
-        for key in combined_heatmaps:
-            if not frames[key].empty:
-                combined_heatmaps[key].append(
-                    frames[key].rename(columns=lambda name: f"{strategy} - {name}"))
+        if want_heatmaps:
+            frames = _performance_heatmaps(returns_by_name, options)
+            for key, chart_title, colour_label, palette, rolling, annotation in heatmap_specs:
+                frame = _tail_months(frames[key], heatmap_months)
+                if frame.empty:
+                    continue
+                low, high = colormaps[f"{palette}_limits"]
+                figure = generate_heatmap_figure(
+                    frame, strategy, chart_title, colour_label, colormaps[palette], low, high,
+                    0.0 if palette != "drawdown" else None, rolling, wrap_width, annotation)
+                if figure is not None:
+                    figures.append((figure, sort_key, f"{chart_title} Heatmap - {strategy}"))
+                sort_key += 1
+            for key in combined_heatmaps:
+                if not frames[key].empty:
+                    combined_heatmaps[key].append(
+                        frames[key].rename(columns=lambda name: f"{strategy} - {name}"))
         sort_key = ((sort_key // 100) + 1) * 100
 
     combined_title = "All Funds (Combined Strategies)"
     if all_returns:
-        sort_key = add_line_charts(all_returns, "All Funds (Combined)", combined_title, sort_key) + 10
+        if want_line_charts:
+            sort_key = add_line_charts(
+                all_returns, "All Funds (Combined)", combined_title, sort_key) + 10
         for key, chart_title, colour_label, palette, rolling, annotation in heatmap_specs:
-            if not combined_heatmaps[key]:
+            if not want_heatmaps or not combined_heatmaps[key]:
                 continue
             merged = pd.concat(combined_heatmaps[key], axis=1).sort_index().dropna(axis=0, how="all")
             frame = _tail_months(merged, heatmap_months)
@@ -2191,16 +2230,18 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
 
     # One row per fund/reason, so a fund excluded from both the strategy chart
     # and the combined chart is only listed once.
-    seen: set[tuple[str, str]] = set()
-    unique_excluded: list[tuple[str, str, int, str]] = []
-    for entry in excluded:
-        name, context, months, reason = entry
-        identity = (name.split(" - ", 1)[-1] if context == "All Funds (Combined)" else name, reason)
-        if identity not in seen:
-            seen.add(identity)
-            unique_excluded.append(entry)
-    figures.insert(0, (create_excluded_funds_page(unique_excluded, min_history, plot_window),
-                       0, "Funds Excluded From Line Charts"))
+    if want_line_charts:
+        seen: set[tuple[str, str]] = set()
+        unique_excluded: list[tuple[str, str, int, str]] = []
+        for entry in excluded:
+            name, context, months, reason = entry
+            identity = (name.split(" - ", 1)[-1] if context == "All Funds (Combined)" else name,
+                        reason)
+            if identity not in seen:
+                seen.add(identity)
+                unique_excluded.append(entry)
+        figures.insert(0, (create_excluded_funds_page(unique_excluded, min_history, plot_window),
+                           0, "Funds Excluded From Line Charts"))
 
     if html_files:
         log.append(f"Saved {len(html_files)} interactive HTML line chart(s).")
@@ -2633,8 +2674,22 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                     text="Require complete rolling periods (recommended for fair comparisons)",
                     variable=boolean_var("performance", "require_full_rolling_window")).grid(
         row=8, column=0, columnspan=3, sticky="w", pady=3)
+    performance_charts = ttk.LabelFrame(performance_tab, text="Charts to produce", padding=8)
+    performance_charts.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    ttk.Checkbutton(performance_charts, text="NAV line charts",
+                    variable=boolean_var("performance", "include_nav_line_charts")).grid(
+        row=0, column=0, sticky="w")
+    ttk.Checkbutton(performance_charts, text="Drawdown line charts",
+                    variable=boolean_var("performance", "include_drawdown_line_charts")).grid(
+        row=0, column=1, sticky="w", padx=(20, 0))
+    ttk.Checkbutton(performance_charts, text="Drawdown / performance heatmaps",
+                    variable=boolean_var("performance", "include_heatmaps")).grid(
+        row=0, column=2, sticky="w", padx=(20, 0))
+    ttk.Label(performance_charts,
+              text="Untick anything you do not need; at least one must stay ticked.",
+              foreground="#555555").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
     performance_outputs = ttk.LabelFrame(performance_tab, text="Files to create", padding=8)
-    performance_outputs.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    performance_outputs.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 0))
     ttk.Checkbutton(performance_outputs, text="Combined PDF report",
                     variable=boolean_var("performance", "create_pdf")).grid(row=0, column=0, sticky="w")
     ttk.Checkbutton(performance_outputs, text="PNG charts",
@@ -2701,6 +2756,11 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                 "dpi": whole_number("clustering", "dpi", "The clustering image resolution"),
             },
             "performance": {
+                "include_nav_line_charts": bool(
+                    variables["performance.include_nav_line_charts"].get()),
+                "include_drawdown_line_charts": bool(
+                    variables["performance.include_drawdown_line_charts"].get()),
+                "include_heatmaps": bool(variables["performance.include_heatmaps"].get()),
                 "rolling_window_months": whole_number("performance", "rolling_window_months",
                                                       "The rolling window"),
                 "min_history_months": whole_number("performance", "min_history_months",

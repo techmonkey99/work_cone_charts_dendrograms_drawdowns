@@ -9,7 +9,7 @@ produced.
 | --- | --- | --- |
 | 1 - Cone charts | Expected-vs-actual excess return cone, rolling total return with rolling volatility, rolling Sharpe, drawdown - plus a compiled PDF | Cone layout only |
 | 2 - Correlation & clustering | Correlation heatmaps, Ward dendrograms, cluster assignments, exclusion audit, per-lookback PDFs | Either layout |
-| 3 - Performance & drawdowns | NAV and drawdown lines (interactive HTML or static), rolling drawdown / performance / risk-adjusted-return heatmaps, combined PDF | Either layout |
+| 3 - Performance & drawdowns | NAV lines, drawdown lines (interactive HTML or static) and rolling drawdown / performance / risk-adjusted-return heatmaps - each pickable on its own - plus a combined PDF | Either layout |
 
 Any combination of modules can run together, as long as the sheet's layout
 supports each one.
@@ -103,6 +103,24 @@ one.
 Funds left out of module 2 or module 3 for having too short a track record are
 not errors. They are recorded with their reason in
 `excluded_funds_audit.csv` and on the excluded-funds page of module 3's PDF.
+
+## Choosing what module 3 produces
+
+Module 3's tab has a **Charts to produce** box with one tick per chart type, so
+a run can be narrowed to just the part you want:
+
+* **NAV line charts** - one line per fund, rebased to 100 at the start of the
+  displayed window.
+* **Drawdown line charts** - the same funds shown as drawdown from their own
+  high-water mark.
+* **Drawdown / performance heatmaps** - the month-by-month grids: rolling
+  drawdown, actual drawdown, rolling performance and rolling risk-adjusted
+  return.
+
+At least one has to stay ticked. Unticking both line charts also drops the
+excluded-funds page, which only describes what the line charts left out. The
+heatmaps are drawn with matplotlib, so they need PDF or PNG output ticked; the
+line charts can go to interactive HTML instead.
 
 ## Output
 
