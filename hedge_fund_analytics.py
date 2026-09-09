@@ -1,7 +1,6 @@
-"""Hedge fund analytics suite - cone charts, correlation clustering and
-performance/drawdown analysis, driven from a single settings window.
-
-This file replaces three separate scripts:
+"""Hedge fund analytics suite - cone charts, correlation clustering,
+performance/drawdown analysis and portfolio risk allocation, driven from a
+single settings window.
 
     Module 1  Cone charts            expected-vs-actual excess return cones,
                                      rolling total return, rolling Sharpe,
@@ -11,6 +10,10 @@ This file replaces three separate scripts:
     Module 3  Performance/drawdowns  NAV and drawdown lines plus rolling
                                      drawdown, rolling performance and
                                      risk-adjusted-return heatmaps.
+    Module 4  Portfolio risk         the portfolio's volatility split across
+                                     module 2's clusters, the dendrogram with
+                                     weights beside it, and a marginal
+                                     add-or-trim chart. Needs a weights row.
 
 ===============================================================================
 EXPECTED WORKBOOK LAYOUTS
@@ -30,7 +33,7 @@ CONE LAYOUT (required by module 1; modules 2 and 3 can also read it)
  6   29/02/2020          -0.40%                 0.25%                0.35%
      ...                  ...                   ...                  ...
 
-PLAIN LAYOUT (modules 2 and 3 only)
+PLAIN LAYOUT (modules 2, 3 and 4)
 
      A                    B                     C
  1   [any label]          Strategy name         Strategy name
@@ -38,6 +41,25 @@ PLAIN LAYOUT (modules 2 and 3 only)
  3   31/01/2020           1.20%                 0.80%
  4   29/02/2020          -0.40%                 0.25%
      ...                  ...                   ...
+
+OPTIONAL WEIGHTS ROW (required by module 4, ignored by the rest)
+
+A row with "Weight" in column A, directly above the first month, holding each
+fund's share of the portfolio. It works with either layout and pushes
+everything below it down one row, so a plain sheet then starts its months on
+row 4 and a cone sheet on row 6:
+
+     A                    B                     C
+ 1   [any label]          Strategy name         Strategy name
+ 2   [any label]          Fund name             Fund name
+ 3   Weight               6.00%                 4.00%
+ 4   31/01/2020           1.20%                 0.80%
+     ...                  ...                   ...
+
+A blank weight means the fund is not held, and it is then measured as a
+candidate rather than left out. Weights may be percentage-formatted cells or
+whole numbers, because their total tells the two apart. A total below 100% is
+cash and above it is gearing; the risk-free column takes no weight.
 
 Rules that apply to both layouts:
 
@@ -106,26 +128,36 @@ LOGGER = logging.getLogger("hedge_fund_analytics")
 SETTINGS_FILENAME = "hf_analytics_settings.json"
 APP_NAME = "HedgeFundAnalytics"
 
-MODULE_KEYS = ("cone", "clustering", "performance")
+MODULE_KEYS = ("cone", "clustering", "performance", "allocation")
 MODULE_TITLES = {
     "cone": "1 - Cone charts",
     "clustering": "2 - Correlation & clustering",
     "performance": "3 - Performance & drawdowns",
+    "allocation": "4 - Portfolio risk allocation",
 }
 MODULE_FOLDERS = {
     "cone": "1_cone_charts",
     "clustering": "2_correlation_clustering",
     "performance": "3_performance_drawdowns",
+    "allocation": "4_portfolio_risk_allocation",
 }
 
 ROW_STRATEGY = 0
 ROW_FUNDNAME = 1
 ROW_CONE_EXPECTED_EXCESS = 2
 ROW_CONE_EXPECTED_VOL = 3
-CONE_DATA_START_ROW = 4
-PLAIN_DATA_START_ROW = 2
+CONE_HEADER_ROWS = 4
+PLAIN_HEADER_ROWS = 2
+CONE_DATA_START_ROW = CONE_HEADER_ROWS
+PLAIN_DATA_START_ROW = PLAIN_HEADER_ROWS
 
 RISK_FREE_PREFIX = "risk free"
+
+# The optional portfolio-weights row sits directly above the first month, and
+# is recognised by its own label in column A rather than by position alone, so
+# a row put in the wrong place is reported instead of being read as something
+# else.
+WEIGHTS_ROW_PREFIX = "weight"
 
 # A single month above this size is reported as unusual; above the hard limit it
 # is treated as a units error, because it almost always means the cells hold
@@ -144,6 +176,14 @@ LAYOUT_DESCRIPTIONS = {
         "Plain layout - row 1 strategy, row 2 fund, monthly returns from row 3."
     ),
 }
+
+WEIGHTS_ROW_DESCRIPTION = (
+    'Optional weights row - a row with "Weight" in column A, directly above the first month, '
+    "holding each fund's share of the portfolio. Everything below it moves down one row, so "
+    "the plain layout then starts its months on row 4 and the cone layout on row 6. A blank "
+    "weight means the fund is not held, which is how a candidate is measured before it is "
+    "bought. Module 4 needs this row; the other modules ignore it."
+)
 
 
 class WorkbookFormatError(Exception):
@@ -173,7 +213,8 @@ def default_settings() -> dict[str, Any]:
             "stop_on_missing_months": True,
             "stop_on_history_gaps": True,
         },
-        "modules": {"cone": True, "clustering": True, "performance": True},
+        "modules": {"cone": True, "clustering": True, "performance": True,
+                    "allocation": False},
         "cone": {
             "use_risk_free": True,
             "use_predetermined_months": False,
@@ -198,6 +239,17 @@ def default_settings() -> dict[str, Any]:
             "max_annotated_funds": 45,
             "label_wrap_width": 30,
             "all_strategies_label_wrap_width": 45,
+            "create_pdf": True,
+            "save_png": True,
+            "save_csv": True,
+            "dpi": 180,
+        },
+        "allocation": {
+            "covariance_method": "ledoit_wolf",
+            "unsmooth_returns": False,
+            "return_basis": "auto",
+            "risk_multiplier_flag": 1.25,
+            "label_wrap_width": 38,
             "create_pdf": True,
             "save_png": True,
             "save_csv": True,
@@ -326,6 +378,27 @@ def validate_settings(settings: dict[str, Any]) -> None:
     if not any((clustering["create_pdf"], clustering["save_png"], clustering["save_csv"])):
         raise ValueError("Clustering: select at least one output type (PDF, PNG or CSV).")
 
+    allocation = settings["allocation"]
+    if allocation["covariance_method"] not in {"ledoit_wolf", "sample"}:
+        raise ValueError(
+            "Portfolio risk: the covariance estimator must be ledoit_wolf or sample."
+        )
+    if allocation["return_basis"] not in {"auto", "expected", "realised"}:
+        raise ValueError(
+            "Portfolio risk: the expected-return basis must be auto, expected or realised."
+        )
+    if float(allocation["risk_multiplier_flag"]) <= 1.0:
+        raise ValueError(
+            "Portfolio risk: the crowding flag must be above 1, since 1 is a cluster carrying "
+            "exactly its share of the risk."
+        )
+    if int(allocation["label_wrap_width"]) < 5:
+        raise ValueError("Portfolio risk: the label wrap width must be at least 5 characters.")
+    if int(allocation["dpi"]) < 72:
+        raise ValueError("Portfolio risk: image resolution must be at least 72 DPI.")
+    if not any((allocation["create_pdf"], allocation["save_png"], allocation["save_csv"])):
+        raise ValueError("Portfolio risk: select at least one output type (PDF, PNG or CSV).")
+
     performance = settings["performance"]
     if int(performance["rolling_window_months"]) < 1:
         raise ValueError("Performance: the rolling window must be at least 1 month.")
@@ -363,10 +436,16 @@ class FundColumn:
     returns: pd.Series
     expected_excess: float | None = None
     expected_vol: float | None = None
+    weight: float | None = None
 
     @property
     def label(self) -> str:
         return f"{self.strategy} - {self.fund}"
+
+    @property
+    def combined_label(self) -> str:
+        """The name used once every strategy is put on one chart."""
+        return f"{self.strategy}::{self.fund}"
 
 
 @dataclass
@@ -381,7 +460,19 @@ class WorkbookData:
     risk_free: pd.Series | None = None
     risk_free_column: str | None = None
     risk_free_label: str | None = None
+    weights_row: int | None = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def has_weights(self) -> bool:
+        return self.weights_row is not None
+
+    def weights(self) -> pd.Series:
+        """Every fund's weight on the combined labels, unheld funds included."""
+        return pd.Series(
+            {fund.combined_label: float(fund.weight or 0.0) for fund in self.funds},
+            dtype=float,
+        )
 
     @property
     def strategies(self) -> list[str]:
@@ -409,6 +500,18 @@ class WorkbookData:
             f"({self.index[0]:%b %Y} to {self.index[-1]:%b %Y})",
             f"Strategies: {len(self.strategies)}   Funds: {len(self.funds)}",
         ]
+        if self.has_weights:
+            weights = self.weights()
+            held = weights[weights != 0.0]
+            lines.append(
+                f"Portfolio weights: row {self.weights_row + 1} - {len(held)} fund(s) held, "
+                f"totalling {weights.sum() * 100:.1f}%; "
+                f"{len(weights) - len(held)} unheld fund(s) measured as candidates."
+            )
+        else:
+            lines.append(
+                "Portfolio weights: no weights row, so module 4 cannot run."
+            )
         if self.risk_free is not None:
             lines.append(
                 f"Risk-free column: {self.risk_free_column} ({self.risk_free_label}) - "
@@ -528,8 +631,15 @@ def to_decimal_series(values: pd.Series) -> tuple[pd.Series, list[int]]:
     return numeric, unreadable
 
 
-def detect_layout(raw: pd.DataFrame) -> tuple[Literal["cone", "plain"], int]:
-    """Work out where the monthly rows start, and therefore which layout it is."""
+def detect_layout(raw: pd.DataFrame) -> tuple[Literal["cone", "plain"], int, int | None]:
+    """Work out where the monthly rows start, and therefore which layout it is.
+
+    Returns the layout, the first row of monthly data and the row holding
+    portfolio weights, or None when the sheet has no weights row. The weights
+    row is optional and adds one row to either layout, so the number of header
+    rows above it - not the position of the first date on its own - is what
+    identifies the layout.
+    """
     first_date_row: int | None = None
     for row in range(min(len(raw), 12)):
         if pd.notna(parse_date_value(raw.iat[row, 0])):
@@ -541,18 +651,45 @@ def detect_layout(raw: pd.DataFrame) -> tuple[Literal["cone", "plain"], int]:
             + LAYOUT_DESCRIPTIONS["cone"]
             + "\n"
             + LAYOUT_DESCRIPTIONS["plain"]
+            + "\n\n"
+            + WEIGHTS_ROW_DESCRIPTION
         )
-    if first_date_row == CONE_DATA_START_ROW:
-        return "cone", CONE_DATA_START_ROW
-    if first_date_row == PLAIN_DATA_START_ROW:
-        return "plain", PLAIN_DATA_START_ROW
+
+    weights_row: int | None = None
+    if first_date_row > 0:
+        candidate = _header_text(raw.iloc[first_date_row - 1], 0)
+        if candidate.lower().startswith(WEIGHTS_ROW_PREFIX):
+            weights_row = first_date_row - 1
+
+    header_rows = first_date_row if weights_row is None else weights_row
+    if header_rows == CONE_HEADER_ROWS:
+        return "cone", first_date_row, weights_row
+    if header_rows == PLAIN_HEADER_ROWS:
+        return "plain", first_date_row, weights_row
+
+    expected = (
+        "Expected row 3 (plain layout) or row 5 (cone layout), each one lower "
+        "if a weights row is used."
+    )
+    stray = ""
+    if weights_row is None and first_date_row > 0:
+        label = _header_text(raw.iloc[first_date_row - 1], 0)
+        if label:
+            stray = (
+                f"\n\nThe row above the first date has '{label}' in column A. If that row holds "
+                'portfolio weights, put "Weight" in column A so it is recognised as one.'
+            )
     raise WorkbookFormatError(
         f"The first date in column A is on Excel row {first_date_row + 1}, which matches "
         "neither supported layout.\n\n"
-        f"Expected row 5 for the cone layout, or row 3 for the plain layout.\n\n"
+        + expected
+        + "\n\n"
         + LAYOUT_DESCRIPTIONS["cone"]
         + "\n"
         + LAYOUT_DESCRIPTIONS["plain"]
+        + "\n\n"
+        + WEIGHTS_ROW_DESCRIPTION
+        + stray
     )
 
 
@@ -577,6 +714,71 @@ def _expected_figure(row: pd.Series, column: int) -> tuple[float | None, str | N
     if unreadable or pd.isna(converted.iloc[0]):
         return None, f"'{value}' is not a number or percentage"
     return float(converted.iloc[0]), None
+
+
+def _weight_figure(row: pd.Series | None, column: int) -> tuple[float | None, str | None]:
+    """Read one portfolio weight cell, or explain why it cannot be read.
+
+    A blank weight is not an error: it means the fund is not currently held,
+    which is exactly how a candidate is measured before it is bought.
+    """
+    if row is None or column >= len(row):
+        return None, None
+    value = row.iloc[column]
+    if pd.isna(value) or (isinstance(value, str) and not str(value).strip()):
+        return None, None
+    converted, unreadable = to_decimal_series(pd.Series([value]))
+    if unreadable or pd.isna(converted.iloc[0]):
+        return None, f"'{value}' is not a number or percentage"
+    return float(converted.iloc[0]), None
+
+
+def normalise_weights(weights: dict[str, float]) -> tuple[dict[str, float], list[str]]:
+    """Put weights on a 0-1 scale, whichever way they were typed.
+
+    Unlike returns, weights carry their own units check: a book adds up to
+    about 100%, so a total near 1 means percentage-formatted cells and a total
+    near 100 means whole numbers such as 5 for 5%. Anything else is reported
+    rather than guessed at. A total below 100% is taken as cash, which holds no
+    risk and therefore no risk contribution.
+    """
+    notes: list[str] = []
+    total = float(sum(weights.values()))
+    if not weights or total <= 0:
+        raise WorkbookFormatError(
+            "The weights row has no positive weights, so there is no portfolio to analyse."
+        )
+    if 0.5 <= total <= 1.5:
+        scaled = dict(weights)
+    elif 50.0 <= total <= 150.0:
+        scaled = {name: value / 100.0 for name, value in weights.items()}
+        notes.append(
+            f"The weights row totals {total:.1f}, so it was read as whole-number percentages "
+            "(5 meaning 5%). Format those cells as % to remove any doubt."
+        )
+    else:
+        raise WorkbookFormatError(
+            f"The weights row totals {total:g}, which is neither about 1 (percentage-formatted "
+            "cells) nor about 100 (whole numbers). Portfolio weights must add up to 100%, or "
+            "less when part of the book is held in cash."
+        )
+
+    invested = float(sum(scaled.values()))
+    if invested < 0.999:
+        notes.append(
+            f"The weights add up to {invested * 100:.1f}%, so the remaining "
+            f"{(1.0 - invested) * 100:.1f}% is treated as cash: it holds none of the "
+            "portfolio's risk."
+        )
+    elif invested > 1.001:
+        notes.append(
+            f"The weights add up to {invested * 100:.1f}%, so the book is geared. "
+            "Risk figures are reported on that geared basis."
+        )
+    if any(value < 0 for value in scaled.values()):
+        shorts = ", ".join(name for name, value in scaled.items() if value < 0)
+        notes.append(f"Negative weight(s) were found and kept as short positions: {shorts}.")
+    return scaled, notes
 
 
 def load_workbook(
@@ -610,7 +812,7 @@ def load_workbook(
             "The worksheet needs column A for dates and at least one fund column from column B."
         )
 
-    layout, data_start = detect_layout(raw)
+    layout, data_start, weights_row_index = detect_layout(raw)
     errors: list[str] = []
     notes: list[str] = []
 
@@ -684,6 +886,8 @@ def load_workbook(
     fundname_row = raw.iloc[ROW_FUNDNAME]
     excess_row = raw.iloc[ROW_CONE_EXPECTED_EXCESS] if layout == "cone" else None
     vol_row = raw.iloc[ROW_CONE_EXPECTED_VOL] if layout == "cone" else None
+    weights_row = raw.iloc[weights_row_index] if weights_row_index is not None else None
+    raw_weights: dict[str, float] = {}
 
     funds: list[FundColumn] = []
     risk_free: pd.Series | None = None
@@ -805,6 +1009,13 @@ def load_workbook(
 
         if is_risk_free:
             risk_free = returns
+            stray_weight, _ = _weight_figure(weights_row, column)
+            if stray_weight is not None:
+                errors.append(
+                    f"The risk-free column {letter} has a portfolio weight on row "
+                    f"{weights_row_index + 1}. The risk-free series is not a fund, so leave its "
+                    "weight blank; cash is whatever the fund weights leave over."
+                )
             continue
 
         expected_excess = expected_vol = None
@@ -824,6 +1035,13 @@ def load_workbook(
                 errors.append(f"{described} has a negative expected volatility.")
                 continue
 
+        weight, weight_problem = _weight_figure(weights_row, column)
+        if weight_problem:
+            errors.append(
+                f"{described}: portfolio weight on row {weights_row_index + 1} - {weight_problem}."
+            )
+            continue
+
         funds.append(
             FundColumn(
                 strategy=strategy,
@@ -832,8 +1050,11 @@ def load_workbook(
                 returns=returns,
                 expected_excess=expected_excess,
                 expected_vol=expected_vol,
+                weight=weight,
             )
         )
+        if weight is not None:
+            raw_weights[f"{strategy}::{fund_name}"] = weight
 
     if not funds and not errors:
         errors.append("No fund columns with usable returns were found from column B onwards.")
@@ -844,6 +1065,23 @@ def load_workbook(
             f"Detected {LAYOUT_DESCRIPTIONS[layout]}\n\n"
             + "\n\n".join(f"{number}. {message}" for number, message in enumerate(errors, start=1))
         )
+
+    # The weights are only put on a 0-1 scale once every column has been read,
+    # because their total is what tells percentages from whole numbers.
+    if weights_row_index is not None:
+        scaled, weight_notes = normalise_weights(raw_weights)
+        notes.extend(weight_notes)
+        for fund in funds:
+            fund.weight = scaled.get(fund.combined_label, 0.0)
+        unheld = [fund.combined_label for fund in funds if not fund.weight]
+        if unheld:
+            notes.append(
+                f"{len(unheld)} fund(s) have no weight, so they are treated as candidates the "
+                "portfolio does not hold: "
+                + ", ".join(unheld[:6])
+                + ("..." if len(unheld) > 6 else "")
+                + "."
+            )
 
     # Reindexing onto the complete calendar is what makes every rolling window
     # count real months rather than however many rows happen to be present.
@@ -861,18 +1099,26 @@ def load_workbook(
         risk_free=risk_free,
         risk_free_column=risk_free_column,
         risk_free_label=risk_free_label,
+        weights_row=weights_row_index,
         notes=notes,
     )
 
 
-def check_modules_against_layout(layout: str, modules: Iterable[str]) -> list[str]:
+def check_modules_against_layout(layout: str, modules: Iterable[str],
+                                 has_weights: bool = False) -> list[str]:
     """Report any selected module the detected layout cannot support."""
+    modules = list(modules)
     problems: list[str] = []
     if "cone" in modules and layout != "cone":
         problems.append(
             "Module 1 (cone charts) needs the expected excess return on row 3 and the expected "
             "volatility on row 4, with monthly returns starting on row 5. This sheet uses the "
             "plain layout, where returns start on row 3.\n\n" + LAYOUT_DESCRIPTIONS["cone"]
+        )
+    if "allocation" in modules and not has_weights:
+        problems.append(
+            "Module 4 (portfolio risk allocation) needs to know what the portfolio holds, and "
+            "this sheet has no weights row.\n\n" + WEIGHTS_ROW_DESCRIPTION
         )
     return problems
 
@@ -892,6 +1138,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import seaborn as sns  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa: E402
 from scipy.spatial.distance import squareform  # noqa: E402
@@ -1471,6 +1718,52 @@ def select_cluster_returns(
     return selected, exclusions
 
 
+@dataclass
+class ClusterUniverse:
+    """Every strategy's usable funds for one lookback, plus the combined frame.
+
+    Module 2 and module 4 both work from this, so the clusters on a risk chart
+    are always the clusters on the dendrogram beside it.
+    """
+
+    timeframe: Timeframe
+    selected: dict[str, pd.DataFrame]
+    exclusions: list[dict[str, Any]]
+    exclusion_counts: dict[str, int]
+    combined: pd.DataFrame
+
+
+def build_cluster_universe(data: WorkbookData, options: dict[str, Any],
+                           period: Timeframe) -> ClusterUniverse:
+    """Choose the funds each strategy contributes to one lookback, and merge them."""
+    frame = data.wide_frame()
+    frame.index = frame.index.to_period("M")
+
+    selected: dict[str, pd.DataFrame] = {}
+    exclusions: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    renamed_frames: list[pd.DataFrame] = []
+
+    for strategy in data.strategies:
+        strategy_frame = frame.xs(strategy, axis=1, level=0, drop_level=True)
+        chosen, excluded = select_cluster_returns(strategy_frame, period, options, strategy)
+        exclusions.extend(excluded)
+        counts[strategy] = len(excluded)
+        selected[strategy] = chosen
+        if chosen.empty:
+            continue
+        renamed = chosen.copy()
+        renamed.columns = [f"{strategy}::{fund}" for fund in chosen.columns]
+        renamed_frames.append(renamed)
+
+    combined = (
+        latest_contiguous_complete_block(
+            pd.concat(renamed_frames, axis=1, join="outer").sort_index())
+        if renamed_frames else pd.DataFrame()
+    )
+    return ClusterUniverse(period, selected, exclusions, counts, combined)
+
+
 def standardised_profiles(returns: pd.DataFrame, method: str) -> np.ndarray:
     values = returns.T.to_numpy(dtype=float)
     if method == "spearman":
@@ -1610,12 +1903,9 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
     log: list[str] = []
     timeframes = normalise_timeframes(options["timeframes"])
 
-    frame = data.wide_frame()
-    frame.index = frame.index.to_period("M")
-
+    universes = {period: build_cluster_universe(data, options, period) for period in timeframes}
     exclusions: list[dict[str, Any]] = []
     run_rows: list[dict[str, Any]] = []
-    combined: dict[Timeframe, list[pd.DataFrame]] = {period: [] for period in timeframes}
 
     with ExitStack() as stack:
         pdfs: dict[Timeframe, PdfPages | None] = {}
@@ -1627,10 +1917,10 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
             )
 
         for strategy in data.strategies:
-            strategy_frame = frame.xs(strategy, axis=1, level=0, drop_level=True)
             for period in timeframes:
-                selected, excluded = select_cluster_returns(strategy_frame, period, options, strategy)
-                exclusions.extend(excluded)
+                universe = universes[period]
+                selected = universe.selected[strategy]
+                excluded_count = universe.exclusion_counts[strategy]
                 if selected.empty:
                     log.append(
                         f"{strategy} [{timeframe_label(period)}]: skipped - fewer than two funds "
@@ -1642,27 +1932,22 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
                 except ValueError as exc:
                     log.append(f"{strategy} [{timeframe_label(period)}]: skipped - {exc}")
                     continue
-                _save_cluster_outputs(result, len(excluded), options, pdfs[period], output_dir)
-                renamed = selected.copy()
-                renamed.columns = [f"{strategy}::{fund}" for fund in selected.columns]
-                combined[period].append(renamed)
+                _save_cluster_outputs(result, excluded_count, options, pdfs[period], output_dir)
                 run_rows.append({
                     "strategy": strategy, "timeframe": timeframe_label(period),
                     "start": str(selected.index.min()), "end": str(selected.index.max()),
                     "months": len(selected), "funds": selected.shape[1],
-                    "excluded_records": len(excluded),
+                    "excluded_records": excluded_count,
                 })
                 log.append(
                     f"{strategy} [{timeframe_label(period)}]: {selected.shape[1]} funds "
                     f"over {len(selected)} months."
                 )
 
-        for period, frames in combined.items():
-            if not frames:
+        for period in timeframes:
+            merged = universes[period].combined
+            if merged.empty:
                 continue
-            merged = latest_contiguous_complete_block(
-                pd.concat(frames, axis=1, join="outer").sort_index()
-            )
             if len(merged) < int(options["min_required_months"]) or merged.shape[1] < 2:
                 log.append(
                     f"All strategies [{timeframe_label(period)}]: skipped - too little common history."
@@ -1684,6 +1969,13 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
                 f"All strategies [{timeframe_label(period)}]: {merged.shape[1]} funds "
                 f"over {len(merged)} months."
             )
+
+    # Kept in strategy-then-lookback order, so the audit CSV reads the way the
+    # analysis is laid out rather than the order the frames happened to be built.
+    for strategy in data.strategies:
+        for period in timeframes:
+            exclusions.extend(row for row in universes[period].exclusions
+                              if row["strategy"] == strategy)
 
     if options["save_csv"]:
         audit_columns = ["strategy", "fund", "timeframe", "reason", "available_months"]
@@ -2234,6 +2526,952 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
 
 
 # =============================================================================
+# Module 4 - portfolio risk allocation
+#
+# Weight is not risk. Three managed-futures funds at 5% each are a smaller
+# block of risk than their 15% of the book suggests, because they diversify
+# one another, while three multi-strategy funds at 5% each are a larger one.
+# This module answers the question the dendrogram raises but cannot settle:
+# how much of the portfolio's risk sits in each of those clusters, and which
+# fund is the next one to add to or trim.
+#
+# The decomposition is the standard one. With weights w and covariance S the
+# portfolio's volatility is sqrt(w'Sw), fund i's marginal contribution is
+# (Sw)i / vol and its component contribution is wi times that. Those
+# components add up to the portfolio's volatility exactly, so they can be
+# grouped by cluster with nothing left over.
+#
+# The clusters come from module 2's own linkage, so a cluster on these charts
+# is the same cluster on the dendrogram beside it.
+# =============================================================================
+
+RISK_PALETTE = "tab10"
+UNHELD_COLOUR = "0.55"
+
+
+def unsmooth_frame(returns: pd.DataFrame, max_rho: float = 0.6,
+                   min_rho: float = 0.05) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Undo return smoothing, one fund at a time (Geltner).
+
+    Monthly hedge fund marks are stale, especially in credit and event, which
+    shows up as positive autocorrelation and makes reported volatility and
+    correlation too low. Reversing it with r*(t) = (r(t) - p r(t-1)) / (1 - p)
+    puts those funds back on a comparable footing with the daily-marked ones.
+
+    Only positive autocorrelation is reversed, and it is capped, because the
+    estimate is noisy on a short window and the correction divides by 1 - p.
+    The first month goes, since it has no predecessor; every fund loses the
+    same one, so the window stays rectangular.
+    """
+    applied: dict[str, float] = {}
+    adjusted = returns.copy()
+    for name in returns.columns:
+        series = returns[name].astype(float)
+        rho = series.autocorr(lag=1)
+        if not np.isfinite(rho) or rho < min_rho:
+            continue
+        rho = float(min(rho, max_rho))
+        adjusted[name] = (series - rho * series.shift(1)) / (1.0 - rho)
+        applied[str(name)] = rho
+    return adjusted.iloc[1:], applied
+
+
+def ledoit_wolf_covariance(returns: pd.DataFrame) -> tuple[np.ndarray, float]:
+    """Sample covariance shrunk towards a scaled identity (Ledoit-Wolf 2004).
+
+    Sixty months of twenty-odd funds is enough to estimate a covariance but
+    not enough to trust every entry of it, and risk contributions are more
+    sensitive to that noise than volatility is. Shrinking towards equal,
+    uncorrelated variances pulls the least reliable entries in by an amount
+    the data itself chooses.
+    """
+    values = returns.to_numpy(dtype=float)
+    months, count = values.shape
+    centred = values - values.mean(axis=0, keepdims=True)
+    sample = (centred.T @ centred) / months
+
+    mean_variance = float(np.trace(sample) / count)
+    target = mean_variance * np.eye(count)
+    dispersion = float(np.sum((sample - target) ** 2) / count)
+    if dispersion <= 0:
+        return sample, 0.0
+
+    # sum_t ||x_t x_t' - S||^2 reduces to sum_t ||x_t||^4 - T ||S||^2, which
+    # avoids building one outer product per month.
+    squared_norms = np.einsum("ij,ij->i", centred, centred)
+    noise = float((np.sum(squared_norms ** 2) - months * np.sum(sample ** 2))
+                  / (count * months * months))
+    shrinkage = float(np.clip(min(noise, dispersion) / dispersion, 0.0, 1.0))
+    return shrinkage * target + (1.0 - shrinkage) * sample, shrinkage
+
+
+def estimate_covariance(returns: pd.DataFrame, method: str) -> tuple[pd.DataFrame, float]:
+    """The monthly covariance of the window, by the chosen estimator."""
+    if method == "ledoit_wolf":
+        matrix, shrinkage = ledoit_wolf_covariance(returns)
+    else:
+        matrix, shrinkage = returns.cov().to_numpy(dtype=float), 0.0
+    return pd.DataFrame(matrix, index=returns.columns, columns=returns.columns), shrinkage
+
+
+def annualised_return(series: pd.Series) -> float:
+    """The compound annual rate implied by a run of monthly returns."""
+    clean = series.dropna().astype(float)
+    if clean.empty:
+        return float("nan")
+    growth = float(np.expm1(np.log1p(clean).sum()))
+    return float((1.0 + growth) ** (12.0 / len(clean)) - 1.0)
+
+
+def describe_cluster(members: Sequence[str]) -> str:
+    """Name a cluster after the strategies inside it, not just its number."""
+    strategies: list[str] = []
+    for name in members:
+        strategy = str(name).split("::", 1)[0]
+        if strategy not in strategies:
+            strategies.append(strategy)
+    counts = {name: sum(1 for member in members if str(member).startswith(f"{name}::"))
+              for name in strategies}
+    ranked = sorted(strategies, key=lambda name: (-counts[name], name))
+    if len(ranked) == 1:
+        return ranked[0]
+    if len(ranked) == 2:
+        return " / ".join(ranked)
+    return f"{ranked[0]} +{len(ranked) - 1} more"
+
+
+@dataclass
+class PortfolioRisk:
+    """One lookback's risk decomposition, ready to chart or write out."""
+
+    timeframe_label: str
+    returns: pd.DataFrame
+    weights: pd.Series
+    covariance: pd.DataFrame
+    analysis: ClusterAnalysis
+    funds: pd.DataFrame
+    clusters: pd.DataFrame
+    portfolio_vol: float
+    portfolio_return: float
+    diversification_ratio: float
+    effective_bets: float
+    weight_concentration: float
+    risk_concentration: float
+    shrinkage: float
+    return_basis: str
+    unsmoothed: dict[str, float]
+    uncovered: pd.Series
+    cash_weight: float
+    notes: list[str]
+
+    @property
+    def cluster_colours(self) -> dict[int, Any]:
+        palette = plt.get_cmap(RISK_PALETTE)
+        return {int(cluster): palette(position % palette.N)
+                for position, cluster in enumerate(sorted(self.clusters["cluster"]))}
+
+
+def expected_returns_for(universe: Sequence[str], data: WorkbookData, returns: pd.DataFrame,
+                         basis: str) -> tuple[pd.Series, str, list[str]]:
+    """The return each fund is expected to earn, on one consistent basis.
+
+    The workbook's own expectations are used when the cone layout supplies one
+    for every fund in the window, because those are the numbers the portfolio
+    was built on. Otherwise every fund falls back to what it actually
+    delivered, rather than mixing a stated view for some funds with a realised
+    number for others on the same axis.
+    """
+    notes: list[str] = []
+    stated = {fund.combined_label: fund.expected_excess for fund in data.funds}
+    complete = all(stated.get(name) is not None for name in universe)
+
+    if basis in {"expected", "auto"} and complete:
+        return (pd.Series({name: float(stated[name]) for name in universe}),
+                "expected excess return from the workbook", notes)
+    if basis == "expected" and not complete:
+        missing = [name for name in universe if stated.get(name) is None]
+        notes.append(
+            f"{len(missing)} fund(s) in the window have no expected excess return on row 3, so "
+            "every fund is shown on realised returns instead: "
+            + ", ".join(missing[:4])
+            + ("..." if len(missing) > 4 else "")
+            + "."
+        )
+
+    realised = pd.Series({name: annualised_return(returns[name]) for name in universe})
+    label = "realised annualised return over the window"
+    if data.risk_free is not None:
+        window = data.risk_free.copy()
+        window.index = window.index.to_period("M")
+        cash = annualised_return(window.reindex(returns.index))
+        if np.isfinite(cash):
+            realised = realised - cash
+            label = (f"realised annualised excess return over the window "
+                     f"({data.risk_free_label}: {format_percent(cash)} a year)")
+    return realised, label, notes
+
+
+def build_portfolio_risk(data: WorkbookData, returns: pd.DataFrame, analysis: ClusterAnalysis,
+                         options: dict[str, Any], label: str) -> PortfolioRisk:
+    """Decompose the portfolio's volatility across its funds and clusters."""
+    notes: list[str] = []
+    universe = [str(name) for name in returns.columns]
+
+    all_weights = data.weights()
+    held = all_weights[all_weights != 0.0]
+    uncovered = held.drop(labels=[name for name in universe if name in held.index])
+    if not uncovered.empty:
+        notes.append(
+            f"{len(uncovered)} held fund(s) are not in this window, so every share below is of "
+            f"the other {(1.0 - uncovered.sum()) * 100:.1f}% of the book rather than all of it. "
+            "Left out: "
+            + ", ".join(f"{name} ({value * 100:.1f}%)" for name, value in uncovered.items())
+            + ". Run module 2 to see why, in its excluded_funds_audit.csv."
+        )
+
+    working = returns.astype(float)
+    unsmoothed: dict[str, float] = {}
+    if options["unsmooth_returns"]:
+        working, unsmoothed = unsmooth_frame(working)
+        if unsmoothed:
+            worst = sorted(unsmoothed.items(), key=lambda item: -item[1])[:3]
+            notes.append(
+                f"Return smoothing was reversed for {len(unsmoothed)} of {len(universe)} funds, "
+                "raising their volatility and correlations. Most autocorrelated: "
+                + ", ".join(f"{name} (rho {rho:.2f})" for name, rho in worst)
+                + f". One month is lost to the adjustment, leaving {len(working)}."
+            )
+        else:
+            notes.append("No fund showed enough positive autocorrelation to unsmooth.")
+
+    covariance, shrinkage = estimate_covariance(working, options["covariance_method"])
+    annual = covariance * 12.0
+
+    weights = pd.Series({name: float(all_weights.get(name, 0.0)) for name in universe})
+    invested = float(weights.sum())
+    if invested <= 0:
+        raise ValueError(
+            "None of the funds in this window is held, so the portfolio has no risk to allocate."
+        )
+    cash_weight = float(1.0 - all_weights.sum())
+
+    vector = weights.to_numpy(dtype=float)
+    matrix = annual.to_numpy(dtype=float)
+    variance = float(vector @ matrix @ vector)
+    if variance <= 0:
+        raise ValueError("The portfolio's estimated variance is not positive.")
+    portfolio_vol = float(np.sqrt(variance))
+
+    marginal = (matrix @ vector) / portfolio_vol          # d(vol) / d(weight)
+    contribution = vector * marginal                      # adds up to the portfolio vol
+    standalone = np.sqrt(np.diag(matrix))
+    risk_share = contribution / portfolio_vol
+    weight_share = vector / invested
+
+    expected, basis, basis_notes = expected_returns_for(universe, data, working,
+                                                        options["return_basis"])
+    notes.extend(basis_notes)
+
+    assignment = analysis.assignments.set_index("fund")["cluster"]
+    table = pd.DataFrame({
+        "strategy": [name.split("::", 1)[0] for name in universe],
+        "fund": [name.split("::", 1)[-1] for name in universe],
+        "label": universe,
+        "cluster": [int(assignment[name]) for name in universe],
+        "weight": vector,
+        "weight_share": weight_share,
+        "expected_return": expected.reindex(universe).to_numpy(dtype=float),
+        "standalone_vol": standalone,
+        "marginal_risk": marginal,
+        "risk_contribution": contribution,
+        "risk_share": risk_share,
+        "correlation_to_portfolio": marginal / standalone,
+    })
+    # A multiplier above 1 means the fund carries more of the risk than of the
+    # money. It is undefined for a fund that is not held, which is the point of
+    # the marginal figure beside it.
+    table["risk_multiplier"] = np.where(
+        table["weight_share"] > 0, table["risk_share"] / table["weight_share"], np.nan)
+    table["risk_share_gap"] = table["risk_share"] - table["weight_share"]
+
+    grouped = table.groupby("cluster", sort=True)
+    clusters = pd.DataFrame({
+        "cluster": [int(key) for key in grouped.groups],
+        "members": grouped.size().to_numpy(),
+        "held": grouped["weight"].apply(lambda column: int((column != 0).sum())).to_numpy(),
+        "weight": grouped["weight"].sum().to_numpy(),
+        "weight_share": grouped["weight_share"].sum().to_numpy(),
+        "risk_share": grouped["risk_share"].sum().to_numpy(),
+        "risk_contribution": grouped["risk_contribution"].sum().to_numpy(),
+    })
+    clusters["label"] = [describe_cluster(list(grouped.get_group(key)["label"]))
+                         for key in clusters["cluster"]]
+    clusters["risk_multiplier"] = np.where(
+        clusters["weight_share"] > 0, clusters["risk_share"] / clusters["weight_share"], np.nan)
+    clusters = clusters.sort_values("risk_share", ascending=False).reset_index(drop=True)
+
+    weighted_vol = float(np.abs(vector) @ standalone)
+    diversification = weighted_vol / portfolio_vol if portfolio_vol > 0 else float("nan")
+    # Squared shares are taken on absolute values so that a short position adds
+    # to concentration rather than quietly cancelling part of it.
+    absolute_risk = np.abs(risk_share)
+    absolute_weight = np.abs(weight_share)
+    risk_concentration = float(np.sum((absolute_risk / absolute_risk.sum()) ** 2))
+    weight_concentration = float(np.sum((absolute_weight / absolute_weight.sum()) ** 2))
+
+    return PortfolioRisk(
+        timeframe_label=label,
+        returns=working,
+        weights=weights,
+        covariance=annual,
+        analysis=analysis,
+        funds=table,
+        clusters=clusters,
+        portfolio_vol=portfolio_vol,
+        portfolio_return=float(vector @ table["expected_return"].to_numpy(dtype=float)),
+        diversification_ratio=diversification,
+        effective_bets=1.0 / risk_concentration if risk_concentration > 0 else float("nan"),
+        weight_concentration=weight_concentration,
+        risk_concentration=risk_concentration,
+        shrinkage=shrinkage,
+        return_basis=basis,
+        unsmoothed=unsmoothed,
+        uncovered=uncovered,
+        cash_weight=cash_weight,
+        notes=notes,
+    )
+
+
+def _allocation_footer(figure: plt.Figure, risk: PortfolioRisk, options: dict[str, Any],
+                       y: float = 0.006) -> None:
+    estimator = ("Ledoit-Wolf shrinkage" if options["covariance_method"] == "ledoit_wolf"
+                 else "sample covariance")
+    if options["covariance_method"] == "ledoit_wolf":
+        estimator += f" ({risk.shrinkage * 100:.0f}% towards the target)"
+    note = (
+        f"{risk.returns.index.min().strftime('%b %Y')}-"
+        f"{risk.returns.index.max().strftime('%b %Y')} ({len(risk.returns)} months); "
+        f"{risk.returns.shape[1]} funds; {estimator}; "
+        f"returns {'unsmoothed' if risk.unsmoothed else 'as reported'}; "
+        f"portfolio volatility {format_percent(risk.portfolio_vol)} a year."
+    )
+    figure.text(0.99, y, note, ha="right", va="bottom", fontsize=7, color="0.25")
+
+
+# Legal form carries no information on a chart, and on a fund called something
+# like "... Global Strategies Fund, Ltd." it is most of the room a label has.
+LEGAL_SUFFIX = re.compile(
+    r"[\s,]+(?:Ltd|Limited|L\.?P|LLC|LLP|plc|Inc|SPC|N\.?V|S\.?A|Co)\.?$", re.IGNORECASE)
+TRAILING_FUND = re.compile(r"[\s,]+Funds?$", re.IGNORECASE)
+
+
+def short_fund_name(name: str) -> str:
+    """A fund's name with its legal form trimmed off, for use on a chart."""
+    text = str(name).strip()
+    for _ in range(3):
+        trimmed = TRAILING_FUND.sub("", LEGAL_SUFFIX.sub("", text)).strip(" ,-")
+        if trimmed == text or not trimmed:
+            break
+        text = trimmed
+    return text or str(name).strip()
+
+
+def _data_width(axis: plt.Axes, text: Any, renderer: Any) -> float:
+    """How wide a drawn label is, measured in the axis's own units."""
+    box = text.get_window_extent(renderer=renderer)
+    inverse = axis.transData.inverted()
+    left, right = inverse.transform([(box.x0, box.y0), (box.x1, box.y0)])
+    return abs(float(right[0]) - float(left[0]))
+
+
+def _fit_label(axis: plt.Axes, renderer: Any, x: float, y: float, name: str,
+               available: float, minimum: int = 7, **kwargs: Any) -> Any | None:
+    """Write a label inside a bar segment, trimmed to what will actually fit.
+
+    Guessing the width from a character count is what puts one fund's name on
+    top of the next one's, because it depends on the font, the figure size and
+    the final layout. Measuring the drawn text instead is exact, so this runs
+    after the layout is settled.
+    """
+    text = axis.text(x, y, name, **kwargs)
+    width = _data_width(axis, text, renderer)
+    if width <= available:
+        return text
+    if width <= 0:
+        text.remove()
+        return None
+    fits = int(len(name) * available / width) - 1
+    if fits < minimum:
+        text.remove()
+        return None
+    text.set_text(name[:fits].rstrip(" ,-"))
+    if _data_width(axis, text, renderer) > available:
+        text.remove()
+        return None
+    return text
+
+
+def _is_dark(colour: Any) -> bool:
+    """Whether white text reads better than black on this background."""
+    red, green, blue = mcolors.to_rgb(colour)
+    return (0.299 * red + 0.587 * green + 0.114 * blue) < 0.55
+
+
+def _shade(colour: Any, position: int, total: int) -> tuple[float, float, float]:
+    """One cluster's colour, lightened a step per fund, so members stay apart."""
+    base = np.array(mcolors.to_rgb(colour))
+    if total <= 1:
+        return tuple(base)
+    return tuple(base + (1.0 - base) * (0.62 * position / (total - 1)))
+
+
+def plot_cluster_risk_budget(risk: PortfolioRisk, options: dict[str, Any]) -> plt.Figure:
+    """Share of money against share of risk, cluster by cluster.
+
+    The left panel is the answer to "where is the risk": a cluster whose risk
+    bar overshoots its weight bar is carrying more than it is being paid for in
+    capital. The right panel says which fund inside the cluster is doing it.
+    """
+    clusters = risk.clusters
+    colours = risk.cluster_colours
+    height = max(4.5, 1.15 * len(clusters) + 2.6)
+    figure, (budget, breakdown) = plt.subplots(
+        1, 2, figsize=(15.5, height), gridspec_kw={"width_ratios": [1.15, 1.0]})
+
+    positions = np.arange(len(clusters))
+    bar_height = 0.36
+    budget.barh(positions - bar_height / 2, clusters["weight_share"], height=bar_height,
+                color="0.72", edgecolor="0.35", linewidth=0.6, label="Share of capital")
+    budget.barh(positions + bar_height / 2, clusters["risk_share"], height=bar_height,
+                color=[colours[int(key)] for key in clusters["cluster"]],
+                edgecolor="0.25", linewidth=0.6)
+
+    limit = float(max(clusters["weight_share"].max(), clusters["risk_share"].max()))
+    for position, row in enumerate(clusters.itertuples()):
+        budget.text(row.weight_share + limit * 0.015, position - bar_height / 2,
+                    format_percent(row.weight_share, 1), va="center", fontsize=8, color="0.35")
+        budget.text(row.risk_share + limit * 0.015, position + bar_height / 2,
+                    format_percent(row.risk_share, 1), va="center", fontsize=8.5,
+                    fontweight="bold", color="0.15")
+
+    labels = [
+        textwrap.fill(f"C{row.cluster}  {row.label}", 30)
+        + f"\n{row.members} funds, {row.held} held"
+        for row in clusters.itertuples()
+    ]
+    budget.set_yticks(positions)
+    budget.set_yticklabels(labels, fontsize=8.5)
+    budget.invert_yaxis()
+    budget.set_xlim(0, limit * 1.22)
+    budget.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    budget.set_xlabel("Share of the invested book")
+    budget.grid(axis="x", linestyle="--", alpha=0.35)
+    budget.set_axisbelow(True)
+    # The risk bars take each cluster's own colour, so the legend cannot show a
+    # single swatch for them without implying one of the clusters is "the" one.
+    budget.legend(
+        handles=[
+            Patch(facecolor="0.72", edgecolor="0.35", label="Share of capital"),
+            Patch(facecolor="0.32", edgecolor="0.25", label="Share of risk (coloured by cluster)"),
+        ],
+        fontsize=8.5, loc="lower right", framealpha=0.92)
+    budget.set_title("Capital against risk, by cluster", fontsize=11, pad=10)
+
+    # The multiplier column earns its place: it is the one number that says
+    # whether a cluster is punching above its weight, and by how much.
+    for position, row in enumerate(clusters.itertuples()):
+        multiplier = row.risk_multiplier
+        if not np.isfinite(multiplier):
+            text, colour = "no weight", "0.5"
+        else:
+            text = f"{multiplier:.2f}x"
+            colour = ("#b2182b" if multiplier >= float(options["risk_multiplier_flag"])
+                      else "#2166ac" if multiplier <= 1.0 / float(options["risk_multiplier_flag"])
+                      else "0.3")
+        budget.annotate(text, xy=(1.0, position), xycoords=("axes fraction", "data"),
+                        xytext=(6, 0), textcoords="offset points", va="center", ha="left",
+                        fontsize=8.5, color=colour, fontweight="bold", annotation_clip=False)
+    budget.annotate("risk\nper unit\nof capital", xy=(1.0, -0.7),
+                    xycoords=("axes fraction", "data"), xytext=(6, 0),
+                    textcoords="offset points", va="center", ha="left", fontsize=7.5,
+                    color="0.4", annotation_clip=False)
+
+    # A segment is only labelled when the name will fit inside it, measured
+    # against this panel's own scale rather than the one beside it.
+    segments: list[tuple[float, float, str, float, Any]] = []
+    for position, cluster in enumerate(clusters["cluster"]):
+        members = (risk.funds[risk.funds["cluster"] == cluster]
+                   .sort_values("risk_share", ascending=False))
+        left = 0.0
+        for order, row in enumerate(members.itertuples()):
+            colour = _shade(colours[int(cluster)], order, len(members))
+            breakdown.barh(position, row.risk_share, left=left, height=0.62,
+                           color=colour, edgecolor="white", linewidth=0.7)
+            segments.append((left + row.risk_share / 2, float(position),
+                             short_fund_name(row.fund), float(row.risk_share), colour))
+            left += row.risk_share
+
+    breakdown.set_yticks(positions)
+    breakdown.set_yticklabels([f"C{key}" for key in clusters["cluster"]], fontsize=9)
+    breakdown.invert_yaxis()
+    breakdown.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    breakdown.set_xlabel("Share of portfolio risk")
+    breakdown.grid(axis="x", linestyle="--", alpha=0.35)
+    breakdown.set_axisbelow(True)
+    breakdown.set_title("Which funds make up each cluster's risk", fontsize=11, pad=10)
+
+    figure.suptitle(
+        f"Portfolio risk by cluster ({risk.timeframe_label})", fontsize=14, y=0.985)
+    _allocation_footer(figure, risk, options)
+    figure.tight_layout(rect=(0.01, 0.035, 0.955, 0.945))
+    figure.subplots_adjust(wspace=0.32)
+
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+    except Exception:  # a backend with no measurable renderer: leave them off
+        return figure
+    for x, y, name, width, colour in segments:
+        _fit_label(breakdown, renderer, x, y, name, width * 0.92,
+                   va="center", ha="center", fontsize=6.4,
+                   color="white" if _is_dark(colour) else "0.12")
+    return figure
+
+
+def cluster_link_colours(linkage_matrix: np.ndarray, clusters: Sequence[int],
+                         colours: dict[int, Any]) -> Callable[[int], Any]:
+    """Colour each branch by the cluster it belongs to, grey where it joins two.
+
+    scipy's own colouring works from a distance threshold, which need not agree
+    with the cluster assignment used everywhere else on the page. Driving it
+    from the assignment instead keeps one cluster one colour across the report.
+    """
+    leaves = len(clusters)
+    node_cluster: dict[int, int | None] = {index: int(clusters[index]) for index in range(leaves)}
+    for step, row in enumerate(linkage_matrix):
+        left, right = int(row[0]), int(row[1])
+        first, second = node_cluster.get(left), node_cluster.get(right)
+        node_cluster[leaves + step] = first if first is not None and first == second else None
+
+    def colour_of(node: int) -> Any:
+        cluster = node_cluster.get(int(node))
+        return mcolors.to_hex(colours[cluster]) if cluster is not None else UNHELD_COLOUR
+
+    return colour_of
+
+
+def plot_weighted_dendrogram(risk: PortfolioRisk, options: dict[str, Any]) -> plt.Figure:
+    """The clustering picture, with what the portfolio actually owns beside it.
+
+    The dendrogram on its own shows which funds behave alike. Putting the
+    weight and the risk contribution in the margin shows how much has been
+    staked on each of those behaviours, which is what the tree cannot say.
+    """
+    order = risk.analysis.leaf_order
+    names = [str(name) for name in risk.analysis.returns.columns]
+    table = risk.funds.set_index("label")
+    colours = risk.cluster_colours
+    count = len(names)
+
+    figure = plt.figure(figsize=(max(13.0, 9.0 + count * 0.2), max(7.5, 4.2 + count * 0.36)))
+    grid = figure.add_gridspec(1, 3, width_ratios=[3.1, 1.0, 1.0])
+    tree = figure.add_subplot(grid[0, 0])
+    weight_axis = figure.add_subplot(grid[0, 1])
+    risk_axis = figure.add_subplot(grid[0, 2])
+
+    assignment = risk.analysis.assignments.set_index("fund")["cluster"]
+    dendrogram(
+        risk.analysis.linkage_matrix, orientation="right",
+        labels=[textwrap.fill(name, int(options["label_wrap_width"])) for name in names],
+        leaf_font_size=max(5, 9 - count // 12), distance_sort=False,
+        link_color_func=cluster_link_colours(
+            risk.analysis.linkage_matrix, [int(assignment[name]) for name in names], colours),
+        ax=tree,
+    )
+    tree.set_xlabel(
+        "Ward distance on standardised return profiles"
+        if options["linkage_method"] == "ward"
+        else f"{options['linkage_method'].title()} linkage distance (1 - correlation)"
+    )
+    tree.set_ylabel("Fund / Strategy::Fund")
+    tree.grid(axis="x", linestyle="--", alpha=0.35)
+    tree.set_title("Hierarchical clustering", fontsize=11, pad=10)
+
+    # scipy lays leaves out at 5, 15, 25 ... in leaf order, so the two margin
+    # panels can share those positions exactly rather than approximating them.
+    positions = np.array([5.0 + 10.0 * step for step in range(count)])
+    ordered = [names[index] for index in order]
+    limits = tree.get_ylim()
+
+    for axis, column, title, formatter in (
+        (weight_axis, "weight", "Weight", lambda value: format_percent(value, 1)),
+        (risk_axis, "risk_share", "Share of risk", lambda value: format_percent(value, 1)),
+    ):
+        values = np.array([float(table.loc[name, column]) for name in ordered])
+        bar_colours = [
+            colours[int(table.loc[name, "cluster"])] if values[step] != 0 else UNHELD_COLOUR
+            for step, name in enumerate(ordered)
+        ]
+        axis.barh(positions, values, height=6.4, color=bar_colours,
+                  edgecolor="0.3", linewidth=0.5)
+        span = float(np.max(np.abs(values))) or 1.0
+        for position, value in zip(positions, values, strict=True):
+            axis.text(value + span * 0.03 if value >= 0 else value - span * 0.03, position,
+                      formatter(value) if value else "-", va="center",
+                      ha="left" if value >= 0 else "right", fontsize=6.8,
+                      color="0.2" if value else "0.55")
+        axis.set_ylim(limits)
+        axis.set_yticks([])
+        axis.set_xlim(min(0.0, float(values.min()) * 1.35), span * 1.34)
+        axis.xaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+        axis.grid(axis="x", linestyle="--", alpha=0.3)
+        axis.set_axisbelow(True)
+        axis.tick_params(axis="x", labelsize=7.5)
+        axis.set_title(title, fontsize=10, pad=10)
+
+    weight_axis.set_xlabel("of the book")
+    risk_axis.set_xlabel("of portfolio volatility")
+    handles = [
+        Line2D([0], [0], marker="s", linestyle="none", markersize=8,
+               markerfacecolor=colours[int(row.cluster)], markeredgecolor="0.3",
+               label=f"C{int(row.cluster)}  {row.label}")
+        for row in risk.clusters.sort_values("cluster").itertuples()
+    ]
+    handles.append(Line2D([0], [0], marker="s", linestyle="none", markersize=8,
+                          markerfacecolor=UNHELD_COLOUR, markeredgecolor="0.3",
+                          label="not held"))
+    figure.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.02, 0.0),
+                  ncol=min(4, len(handles)), fontsize=8, frameon=False)
+
+    figure.suptitle(
+        f"Where the portfolio's risk sits in the cluster tree ({risk.timeframe_label})",
+        fontsize=14, y=0.985)
+    _allocation_footer(figure, risk, options, y=0.052)
+    figure.tight_layout(rect=(0.01, 0.095, 0.99, 0.945))
+    figure.subplots_adjust(wspace=0.06)
+    return figure
+
+
+def _spread_labels(values: Sequence[float], low: float, high: float,
+                   gap: float) -> list[float]:
+    """Push point labels apart until none overlaps, keeping their order.
+
+    One pass upwards opens the gaps; a second pass downwards pulls the column
+    back inside the axis when the first pass has run past the top. With a gap
+    of at most the span divided by the number of labels, the two passes always
+    leave a layout that fits.
+    """
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    placed = [float(value) for value in values]
+
+    previous = low - gap
+    for index in order:
+        placed[index] = max(placed[index], previous + gap)
+        previous = placed[index]
+
+    previous = high + gap
+    for index in reversed(order):
+        placed[index] = min(placed[index], previous - gap)
+        previous = placed[index]
+    return placed
+
+
+def plot_add_trim_scatter(risk: PortfolioRisk, options: dict[str, Any]) -> plt.Figure:
+    """What the next pound into each fund costs in risk, against what it earns.
+
+    The diagonal is the portfolio's own return per unit of risk. A fund above
+    it improves the portfolio's return-to-risk at the margin, so the next pound
+    is better spent there; a fund below it is being paid less than the risk it
+    adds. The portfolio itself sits on the line by construction, because the
+    marginal contributions add up to its volatility.
+    """
+    table = risk.funds.sort_values("marginal_risk").reset_index(drop=True)
+    colours = risk.cluster_colours
+    count = len(table)
+    figure, axis = plt.subplots(figsize=(14.5, max(9.0, 5.4 + count * 0.24)))
+
+    slope = risk.portfolio_return / risk.portfolio_vol if risk.portfolio_vol > 0 else np.nan
+    x_values = table["marginal_risk"].to_numpy(dtype=float)
+    y_values = table["expected_return"].to_numpy(dtype=float)
+
+    x_low = min(0.0, float(np.nanmin(x_values)) * 1.15)
+    x_high = max(float(np.nanmax(x_values)), risk.portfolio_vol) * 1.12
+    y_low = min(float(np.nanmin(y_values)), risk.portfolio_return)
+    y_high = max(float(np.nanmax(y_values)), risk.portfolio_return)
+    y_pad = (y_high - y_low) * 0.12 or 0.01
+    y_low, y_high = y_low - y_pad, y_high + y_pad
+    axis.set_xlim(x_low, x_high)
+    axis.set_ylim(y_low, y_high)
+
+    if np.isfinite(slope):
+        line = np.array([x_low, x_high])
+        axis.fill_between(line, slope * line, y_high, color="#2166ac", alpha=0.055, zorder=0)
+        axis.fill_between(line, y_low, slope * line, color="#b2182b", alpha=0.055, zorder=0)
+        axis.plot(line, slope * line, color="0.3", linestyle="--", linewidth=1.3, zorder=2,
+                  label=f"Portfolio return per unit of risk ({slope:.2f})")
+
+    held = (table["weight"] != 0).to_numpy()
+    sizes = (60.0 + 2600.0 * table["weight"].abs()).to_numpy()
+    axis.scatter(x_values[held], y_values[held], s=sizes[held],
+                 c=[colours[int(key)] for key in table.loc[held, "cluster"]],
+                 edgecolor="0.2", linewidth=0.8, alpha=0.85, zorder=3)
+    if (~held).any():
+        axis.scatter(x_values[~held], y_values[~held], s=130, facecolor="none",
+                     edgecolor=[colours[int(key)] for key in table.loc[~held, "cluster"]],
+                     linewidth=1.9, linestyle="--", zorder=3)
+    axis.scatter([risk.portfolio_vol], [risk.portfolio_return], marker="*", s=520,
+                 color="#111111", edgecolor="white", linewidth=1.0, zorder=5,
+                 label="The portfolio as it stands")
+
+    # Labels go in the margin at the right, spread far enough apart to stay
+    # legible however many funds share a return, with a leader back to the dot.
+    positions = _spread_labels(list(y_values), y_low, y_high,
+                               (y_high - y_low) / (count + 1.4))
+    for row, position in zip(table.itertuples(), positions, strict=True):
+        name = short_fund_name(row.fund)[:38]
+        suffix = "" if row.weight else "  (not held)"
+        axis.annotate(
+            f"{name}{suffix}", xy=(row.marginal_risk, row.expected_return),
+            xytext=(x_high * 1.015, position), textcoords="data",
+            fontsize=7.4, va="center", ha="left",
+            color="0.2" if row.weight else "0.45",
+            arrowprops={"arrowstyle": "-", "color": "0.78", "linewidth": 0.6,
+                        "shrinkA": 1, "shrinkB": 3,
+                        "connectionstyle": "arc3,rad=0.0"},
+            annotation_clip=False,
+        )
+
+    if y_low < 0 < y_high:
+        axis.axhline(0.0, color="0.75", linewidth=0.8, zorder=1)
+    axis.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    axis.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    axis.set_xlabel("Marginal contribution to portfolio volatility - what the next pound adds")
+    axis.set_ylabel(f"Expected return\n({risk.return_basis})")
+    axis.grid(linestyle="--", alpha=0.3)
+    axis.set_axisbelow(True)
+    axis.text(0.0, 1.012,
+              "Above the line, the next pound improves the portfolio's return per unit of risk. "
+              "Below it, trimming does. Bubble size is the current weight.",
+              transform=axis.transAxes, ha="left", va="bottom", fontsize=8.8, color="0.35")
+
+    handles = [
+        Line2D([0], [0], marker="o", linestyle="none", markersize=9,
+               markerfacecolor=colours[int(row.cluster)], markeredgecolor="0.2",
+               label=f"C{int(row.cluster)}  {row.label}")
+        for row in risk.clusters.sort_values("cluster").itertuples()
+    ]
+    handles.append(Line2D([0], [0], marker="o", linestyle="none", markersize=9,
+                          markerfacecolor="none", markeredgecolor="0.4", markeredgewidth=1.7,
+                          label="Not held - a candidate"))
+    handles.extend(axis.get_legend_handles_labels()[0])
+    figure.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.015, 0.0),
+                  ncol=min(4, len(handles)), fontsize=8.2, frameon=False)
+
+    figure.suptitle(f"Where the next pound belongs ({risk.timeframe_label})",
+                    fontsize=14, y=0.985)
+    _allocation_footer(figure, risk, options, y=0.062)
+    figure.tight_layout(rect=(0.01, 0.115, 0.795, 0.945))
+    return figure
+
+
+def concentration_lines(risk: PortfolioRisk) -> list[tuple[str, str]]:
+    """The headline numbers, as label-and-value pairs."""
+    funds = len(risk.funds)
+    held = int((risk.funds["weight"] != 0).sum())
+    top = risk.funds.nlargest(min(5, funds), "risk_share")["risk_share"].sum()
+    return [
+        ("Portfolio volatility, a year", format_percent(risk.portfolio_vol)),
+        ("Funds held, of those in the window", f"{held} of {funds}"),
+        ("Effective number of bets", f"{risk.effective_bets:.1f}"),
+        ("Diversification ratio", f"{risk.diversification_ratio:.2f}"),
+        ("Risk in the top 5 funds", format_percent(top)),
+        ("Concentration of capital (Herfindahl)", f"{risk.weight_concentration:.3f}"),
+        ("Concentration of risk (Herfindahl)", f"{risk.risk_concentration:.3f}"),
+        ("Cash", format_percent(risk.cash_weight) if risk.cash_weight > 0.0005 else "none"),
+    ]
+
+
+def plot_concentration_summary(risk: PortfolioRisk, options: dict[str, Any]) -> plt.Figure:
+    """The headline numbers, and every fund's gap between risk and capital.
+
+    A fund's bar is how much more, or less, of the portfolio's risk it carries
+    than of its money. The long bars are where a decision is worth making: a
+    large positive bar is a position bigger in risk than it looks on a
+    weights sheet.
+    """
+    # A fund the portfolio does not hold has no share of either the risk or the
+    # capital, so its gap is zero by construction and says nothing. The place
+    # to judge those is the marginal chart, not this one.
+    table = (risk.funds[risk.funds["weight"] != 0]
+             .sort_values("risk_share_gap", ascending=False).reset_index(drop=True))
+    unheld = int((risk.funds["weight"] == 0).sum())
+    colours = risk.cluster_colours
+    height = max(7.0, 3.4 + 0.34 * len(table))
+    figure = plt.figure(figsize=(13.5, height))
+    grid = figure.add_gridspec(2, 1, height_ratios=[1.35, 2.2 + 0.055 * len(table)])
+    headline = figure.add_subplot(grid[0, 0])
+    gaps = figure.add_subplot(grid[1, 0])
+
+    headline.axis("off")
+    pairs = concentration_lines(risk)
+    columns = 4
+    for index, (label, value) in enumerate(pairs):
+        column, row = index % columns, index // columns
+        x = 0.015 + column * (0.985 / columns)
+        y = 0.90 - row * 0.42
+        headline.text(x, y, value, fontsize=17, fontweight="bold", color="#1a1a1a",
+                      transform=headline.transAxes, va="center")
+        headline.text(x, y - 0.13, textwrap.fill(label, 24), fontsize=8, color="0.42",
+                      transform=headline.transAxes, va="top")
+    trailer = (
+        f"{len(risk.funds)} funds behaving like {risk.effective_bets:.1f} independent ones. "
+        "The effective number of bets counts positions by how much distinct risk they carry, "
+        "so two funds that move together count close to one."
+    )
+    if unheld:
+        trailer += (f" {unheld} fund(s) in the window are not held, so they are left off the "
+                    "chart below.")
+    headline.text(0.015, -0.10, textwrap.fill(trailer, 132), fontsize=8.5, color="0.42",
+                  transform=headline.transAxes, va="top")
+
+    positions = np.arange(len(table))
+    values = table["risk_share_gap"].to_numpy(dtype=float)
+    gaps.barh(positions, values, color=[colours[int(key)] for key in table["cluster"]],
+              edgecolor="0.25", linewidth=0.6, height=0.68)
+    gaps.axvline(0.0, color="0.35", linewidth=1.0)
+
+    span = float(np.max(np.abs(values))) or 1.0
+    for position, row in enumerate(table.itertuples()):
+        offset = span * 0.02
+        gaps.text(row.risk_share_gap + (offset if row.risk_share_gap >= 0 else -offset),
+                  position,
+                  f"{format_percent(row.risk_share, 1)} risk vs "
+                  f"{format_percent(row.weight_share, 1)} capital",
+                  va="center", ha="left" if row.risk_share_gap >= 0 else "right",
+                  fontsize=6.8, color="0.35")
+
+    gaps.set_yticks(positions)
+    gaps.set_yticklabels(
+        [textwrap.fill(f"C{int(row.cluster)}  {row.fund}", 46) for row in table.itertuples()],
+        fontsize=7.4)
+    gaps.invert_yaxis()
+    gaps.set_xlim(-span * 1.55, span * 1.55)
+    gaps.xaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    gaps.set_xlabel("Share of portfolio risk minus share of capital")
+    gaps.grid(axis="x", linestyle="--", alpha=0.3)
+    gaps.set_axisbelow(True)
+    gaps.set_title("Funds carrying more, or less, risk than their weight suggests",
+                   fontsize=11, pad=10)
+
+    figure.suptitle(f"Portfolio concentration ({risk.timeframe_label})", fontsize=14, y=0.985)
+    _allocation_footer(figure, risk, options)
+    figure.tight_layout(rect=(0.01, 0.035, 0.99, 0.95))
+    figure.subplots_adjust(hspace=0.42)
+    return figure
+
+
+def _save_allocation_figure(figure: plt.Figure, stem: Path, pdf: PdfPages | None,
+                            options: dict[str, Any]) -> None:
+    if options["save_png"]:
+        figure.savefig(stem.with_suffix(".png"), dpi=int(options["dpi"]), bbox_inches="tight")
+    if pdf is not None:
+        pdf.savefig(figure, dpi=int(options["dpi"]), bbox_inches="tight")
+    plt.close(figure)
+
+
+def allocation_log_lines(risk: PortfolioRisk, options: dict[str, Any]) -> list[str]:
+    """What the run report says about one lookback."""
+    lines = [
+        f"{risk.timeframe_label}: {risk.returns.shape[1]} funds over {len(risk.returns)} months; "
+        f"portfolio volatility {format_percent(risk.portfolio_vol)} a year; "
+        f"{risk.effective_bets:.1f} effective bets from "
+        f"{int((risk.funds['weight'] != 0).sum())} holdings."
+    ]
+    for row in risk.clusters.itertuples():
+        multiplier = (f"{row.risk_multiplier:.2f}x capital"
+                      if np.isfinite(row.risk_multiplier) else "not held")
+        lines.append(
+            f"  C{row.cluster} {row.label}: {format_percent(row.risk_share)} of risk on "
+            f"{format_percent(row.weight_share)} of capital ({multiplier})."
+        )
+    flag = float(options["risk_multiplier_flag"])
+    crowded = risk.clusters[risk.clusters["risk_multiplier"] >= flag]
+    if not crowded.empty:
+        lines.append(
+            f"  Carrying more risk than capital by {flag:g}x or more: "
+            + ", ".join(f"C{int(row.cluster)} {row.label}" for row in crowded.itertuples())
+            + "."
+        )
+    lines.extend(f"  {note}" for note in risk.notes)
+    return lines
+
+
+def run_allocation_module(data: WorkbookData, options: dict[str, Any],
+                          cluster_options: dict[str, Any], output_dir: Path) -> list[str]:
+    """Allocate the portfolio's risk across the clusters module 2 found.
+
+    The clustering settings are shared with module 2 on purpose, so the two
+    modules can never disagree about which funds belong together.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log: list[str] = []
+    timeframes = normalise_timeframes(cluster_options["timeframes"])
+    written = False
+
+    for period in timeframes:
+        label = timeframe_label(period)
+        universe = build_cluster_universe(data, cluster_options, period)
+        merged = universe.combined
+        if merged.empty or merged.shape[1] < 2 or len(merged) < int(
+                cluster_options["min_required_months"]):
+            log.append(f"{label}: skipped - too little common history across the strategies.")
+            continue
+        try:
+            analysis = build_cluster_analysis("All Strategies Combined", label, merged,
+                                              cluster_options)
+            risk = build_portfolio_risk(
+                data, merged, analysis, {**options, **{
+                    "linkage_method": cluster_options["linkage_method"]}}, label)
+        except (ValueError, WorkbookFormatError) as exc:
+            log.append(f"{label}: skipped - {exc}")
+            continue
+
+        charting = {**options, "linkage_method": cluster_options["linkage_method"]}
+        stem = output_dir / f"Portfolio_Risk_{label}"
+        pdf_path = output_dir / f"Portfolio_Risk_Report_{label}.pdf"
+        with ExitStack() as stack:
+            pdf = stack.enter_context(PdfPages(pdf_path)) if options["create_pdf"] else None
+            for figure, suffix in (
+                (plot_cluster_risk_budget(risk, charting), "cluster_risk_budget"),
+                (plot_weighted_dendrogram(risk, charting), "dendrogram_with_weights"),
+                (plot_add_trim_scatter(risk, charting), "add_or_trim"),
+                (plot_concentration_summary(risk, charting), "concentration"),
+            ):
+                _save_allocation_figure(figure, stem.with_name(f"{stem.name}_{suffix}"),
+                                        pdf, options)
+
+        if options["save_csv"]:
+            columns = ["strategy", "fund", "label", "cluster", "weight", "weight_share",
+                       "expected_return", "standalone_vol", "marginal_risk",
+                       "risk_contribution", "risk_share", "risk_multiplier", "risk_share_gap",
+                       "correlation_to_portfolio"]
+            (risk.funds[columns].sort_values("risk_share", ascending=False)
+             .to_csv(stem.with_name(f"{stem.name}_fund_contributions.csv"), index=False))
+            risk.clusters.to_csv(stem.with_name(f"{stem.name}_cluster_budget.csv"), index=False)
+            pd.DataFrame(concentration_lines(risk), columns=["measure", "value"]).to_csv(
+                stem.with_name(f"{stem.name}_summary.csv"), index=False)
+            written = True
+
+        log.extend(allocation_log_lines(risk, options))
+
+    if written:
+        log.append("Wrote the fund contributions, cluster budget and summary as CSV.")
+    if not log:
+        log.append("No lookback had enough common history to allocate risk over.")
+    return log
+
+
+# =============================================================================
 # Orchestration
 # =============================================================================
 
@@ -2255,7 +3493,8 @@ def check_workbook(settings: dict[str, Any]) -> WorkbookData:
         stop_on_missing_months=bool(workbook["stop_on_missing_months"]),
         stop_on_history_gaps=bool(workbook["stop_on_history_gaps"]),
     )
-    problems = check_modules_against_layout(data.layout, selected_modules(settings))
+    problems = check_modules_against_layout(
+        data.layout, selected_modules(settings), has_weights=data.has_weights)
     if problems:
         raise WorkbookFormatError("\n\n".join(problems))
     return data
@@ -2286,17 +3525,23 @@ def run_analysis(settings: dict[str, Any], data: WorkbookData | None = None) -> 
         report.extend(f"  - {note}" for note in data.notes)
         report.append("")
 
+    # Module 4 is handed the clustering settings as well as its own, so its
+    # clusters are always the ones module 2 drew.
     runners: dict[str, Callable[[WorkbookData, dict[str, Any], Path], list[str]]] = {
-        "cone": run_cone_module,
-        "clustering": run_clustering_module,
-        "performance": run_performance_module,
+        "cone": lambda book, chosen, folder: run_cone_module(book, chosen["cone"], folder),
+        "clustering": lambda book, chosen, folder: run_clustering_module(
+            book, chosen["clustering"], folder),
+        "performance": lambda book, chosen, folder: run_performance_module(
+            book, chosen["performance"], folder),
+        "allocation": lambda book, chosen, folder: run_allocation_module(
+            book, chosen["allocation"], chosen["clustering"], folder),
     }
     for key in selected_modules(settings):
         report.append(f"--- {MODULE_TITLES[key]} ---")
         LOGGER.info("Running %s", MODULE_TITLES[key])
         try:
             report.extend(f"  {line}" for line in
-                          runners[key](data, settings[key], output_root / MODULE_FOLDERS[key]))
+                          runners[key](data, settings, output_root / MODULE_FOLDERS[key]))
         except Exception as exc:  # keep the other modules going, and say what failed
             LOGGER.exception("%s failed", MODULE_TITLES[key])
             report.append(f"  FAILED: {exc}")
@@ -2366,10 +3611,12 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
     cone_tab = ttk.Frame(notebook, padding=12)
     cluster_tab = ttk.Frame(notebook, padding=12)
     performance_tab = ttk.Frame(notebook, padding=12)
+    allocation_tab = ttk.Frame(notebook, padding=12)
     notebook.add(run_tab, text="Workbook & modules")
     notebook.add(cone_tab, text=MODULE_TITLES["cone"])
     notebook.add(cluster_tab, text=MODULE_TITLES["clustering"])
     notebook.add(performance_tab, text=MODULE_TITLES["performance"])
+    notebook.add(allocation_tab, text=MODULE_TITLES["allocation"])
 
     def labelled_entry(parent: ttk.Frame, row: int, label: str, variable: tk.StringVar,
                        hint: str = "", width: int | None = None) -> None:
@@ -2481,6 +3728,10 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
     ttk.Checkbutton(modules_box, text=MODULE_TITLES["performance"] +
                     "  (either layout)", variable=module_vars["performance"]).grid(
         row=2, column=0, sticky="w", pady=2)
+    ttk.Checkbutton(modules_box, text=MODULE_TITLES["allocation"] +
+                    '  (either layout, plus a "Weight" row above the first month)',
+                    variable=module_vars["allocation"]).grid(
+        row=3, column=0, sticky="w", pady=2)
 
     checks_box = ttk.LabelFrame(run_tab, text="Data checks and output", padding=10)
     checks_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2641,6 +3892,46 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                     variable=boolean_var("performance", "save_png")).grid(
         row=0, column=1, sticky="w", padx=(20, 0))
 
+    # ---- Module 4 tab ------------------------------------------------------
+    allocation_tab.columnconfigure(1, weight=1)
+    ttk.Label(allocation_tab,
+              text=("Allocates the portfolio's volatility across the clusters module 2 finds, so "
+                    "the clusters here are the ones on that dendrogram. It uses module 2's "
+                    "lookbacks, clustering method and cluster count. Needs a weights row: put "
+                    '"Weight" in column A directly above the first month, and each fund\'s share '
+                    "of the portfolio in its own column. Leave a fund blank to measure it as a "
+                    "candidate the portfolio does not yet hold."),
+              foreground="#555555", wraplength=860).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+    labelled_combo(allocation_tab, 1, "Covariance estimator",
+                   string_var("allocation", "covariance_method"), ("ledoit_wolf", "sample"),
+                   "shrinkage is steadier on short windows")
+    labelled_combo(allocation_tab, 2, "Expected returns from",
+                   string_var("allocation", "return_basis"), ("auto", "expected", "realised"),
+                   "auto = row 3 where every fund has one")
+    labelled_entry(allocation_tab, 3, "Flag a cluster at",
+                   string_var("allocation", "risk_multiplier_flag"),
+                   "x its share of capital, or more", width=10)
+    labelled_entry(allocation_tab, 4, "Fund-label wrap width",
+                   string_var("allocation", "label_wrap_width"), "characters", width=10)
+    labelled_entry(allocation_tab, 5, "Image resolution", string_var("allocation", "dpi"),
+                   "DPI", width=10)
+    ttk.Checkbutton(allocation_tab,
+                    text=("Reverse return smoothing before measuring risk (raises the volatility "
+                          "of funds whose marks lag, such as credit)"),
+                    variable=boolean_var("allocation", "unsmooth_returns")).grid(
+        row=6, column=0, columnspan=3, sticky="w", pady=3)
+    allocation_outputs = ttk.LabelFrame(allocation_tab, text="Files to create", padding=8)
+    allocation_outputs.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+    ttk.Checkbutton(allocation_outputs, text="PDF report per lookback",
+                    variable=boolean_var("allocation", "create_pdf")).grid(row=0, column=0, sticky="w")
+    ttk.Checkbutton(allocation_outputs, text="PNG charts",
+                    variable=boolean_var("allocation", "save_png")).grid(
+        row=0, column=1, sticky="w", padx=(20, 0))
+    ttk.Checkbutton(allocation_outputs, text="CSV contributions, budget and summary",
+                    variable=boolean_var("allocation", "save_csv")).grid(
+        row=0, column=2, sticky="w", padx=(20, 0))
+
     # ---- Collecting and validating ----------------------------------------
     def whole_number(section: str, key: str, label: str) -> int:
         text = variables[f"{section}.{key}"].get().strip()
@@ -2655,6 +3946,12 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
             drawdown_threshold = float(variables["cone.drawdown_threshold_pct"].get().strip())
         except ValueError as exc:
             raise ValueError("The cone drawdown threshold must be a number, such as 5.") from exc
+        try:
+            crowding_flag = float(variables["allocation.risk_multiplier_flag"].get().strip())
+        except ValueError as exc:
+            raise ValueError(
+                "The portfolio-risk crowding flag must be a number, such as 1.25."
+            ) from exc
         collected = {
             "workbook": {
                 "path": excel_var.get().strip().strip('"'),
@@ -2699,6 +3996,18 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                 "save_png": bool(variables["clustering.save_png"].get()),
                 "save_csv": bool(variables["clustering.save_csv"].get()),
                 "dpi": whole_number("clustering", "dpi", "The clustering image resolution"),
+            },
+            "allocation": {
+                "covariance_method": variables["allocation.covariance_method"].get(),
+                "return_basis": variables["allocation.return_basis"].get(),
+                "unsmooth_returns": bool(variables["allocation.unsmooth_returns"].get()),
+                "risk_multiplier_flag": crowding_flag,
+                "label_wrap_width": whole_number("allocation", "label_wrap_width",
+                                                 "The portfolio-risk label wrap width"),
+                "create_pdf": bool(variables["allocation.create_pdf"].get()),
+                "save_png": bool(variables["allocation.save_png"].get()),
+                "save_csv": bool(variables["allocation.save_csv"].get()),
+                "dpi": whole_number("allocation", "dpi", "The portfolio-risk image resolution"),
             },
             "performance": {
                 "rolling_window_months": whole_number("performance", "rolling_window_months",
