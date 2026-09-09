@@ -78,8 +78,12 @@ Other rules:
 
 ## The format check
 
-The check runs first and reports every problem at once, rather than stopping at
-the first one. It refuses to run on duplicate months, unreadable dates,
+The check runs automatically as soon as you pick a workbook, and again whenever
+you change the tab, the modules or either data check, so the panel at the
+bottom of the window always reflects what a run would do. It reports every
+problem at once, rather than stopping at the first one. Automatic checks only
+write to that panel; the buttons are there to re-check on demand, after editing
+the workbook in Excel. It refuses to run on duplicate months, unreadable dates,
 non-numeric cells, missing strategy or fund names, duplicate fund names inside
 a strategy, returns of -100% or worse, returns large enough to imply the wrong
 units, and funds whose return never changes.

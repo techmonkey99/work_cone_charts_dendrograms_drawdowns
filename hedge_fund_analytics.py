@@ -2499,7 +2499,7 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
     run_tab.rowconfigure(5, weight=1)
     check_box.columnconfigure(0, weight=1)
     check_box.rowconfigure(1, weight=1)
-    ttk.Button(check_box, text="Check the workbook now",
+    ttk.Button(check_box, text="Check the workbook again",
                command=lambda: perform_check()).grid(row=0, column=0, sticky="w", pady=(0, 6))
     check_output = tk.Text(check_box, height=9, wrap="word")
     check_output.grid(row=1, column=0, sticky="nsew")
@@ -2751,6 +2751,50 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
         write_check_output("\n".join(lines))
         return data
 
+    # ---- Checking automatically -------------------------------------------
+    # The check re-runs on its own whenever something that could change its
+    # result is altered: the workbook, the tab, the modules or the two data
+    # checks. It is debounced, so typing a path does not start a check per
+    # keystroke, and it never raises a dialog - the panel is the only place an
+    # automatic result appears. The buttons stay, for re-checking on demand
+    # after the workbook has been edited in Excel.
+    pending_check: list[str] = []
+    check_running: list[bool] = []
+
+    def schedule_auto_check(*_args: Any) -> None:
+        for job in pending_check:
+            try:
+                root.after_cancel(job)
+            except tk.TclError:
+                pass
+        pending_check.clear()
+        pending_check.append(root.after(400, run_auto_check))
+
+    def run_auto_check() -> None:
+        pending_check.clear()
+        if check_running:
+            return
+        path_text = excel_var.get().strip().strip('"')
+        if not path_text or not Path(path_text).expanduser().is_file():
+            write_check_output(
+                "Choose a workbook, and its format check will appear here automatically."
+            )
+            return
+        check_running.append(True)
+        try:
+            write_check_output("Checking the workbook...")
+            check_output.update_idletasks()
+            perform_check(quiet=True)
+        finally:
+            check_running.clear()
+
+    excel_var.trace_add("write", schedule_auto_check)
+    sheet_var.trace_add("write", schedule_auto_check)
+    for auto_name in ("workbook.stop_on_missing_months", "workbook.stop_on_history_gaps"):
+        variables[auto_name].trace_add("write", schedule_auto_check)
+    for module_variable in module_vars.values():
+        module_variable.trace_add("write", schedule_auto_check)
+
     def reset_defaults() -> None:
         defaults = default_settings()
         for name, variable in variables.items():
@@ -2800,6 +2844,7 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
     root.protocol("WM_DELETE_WINDOW", cancel)
     root.bind("<Escape>", lambda _event: cancel())
     refresh_sheet_list(force=True)
+    schedule_auto_check()
     root.update_idletasks()
     root.geometry(
         f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}"
