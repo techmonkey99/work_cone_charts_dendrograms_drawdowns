@@ -1,0 +1,12 @@
+# Settings written by hedge_fund_analytics.py
+hf_analytics_settings.json
+
+# Analysis output
+hedge_fund_outputs/
+*.xlsx
+!examples/*.xlsx
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
