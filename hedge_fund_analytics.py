@@ -427,6 +427,32 @@ class WorkbookData:
         return lines
 
 
+def list_sheet_names(path: Path | str) -> list[str]:
+    """The workbook's tab names, in the order Excel shows them."""
+    with pd.ExcelFile(path) as workbook:
+        return [str(name) for name in workbook.sheet_names]
+
+
+def resolve_sheet_choice(names: Sequence[str], current: Any) -> str:
+    """Pick the tab to select for a workbook, given whatever was chosen before.
+
+    A tab that is still there is kept, including when it was saved as a sheet
+    number or typed with different capitalisation. Otherwise the first tab is
+    selected, which is what a new workbook should open on.
+    """
+    if not names:
+        return str(current)
+    wanted = str(current).strip()
+    if wanted in names:
+        return wanted
+    if wanted.isdigit() and int(wanted) < len(names):
+        return names[int(wanted)]
+    for name in names:
+        if name.strip().casefold() == wanted.casefold():
+            return name
+    return names[0]
+
+
 def column_letter(index: int) -> str:
     """Zero-based column number to its Excel letter, so messages match the sheet."""
     letters = ""
@@ -570,8 +596,13 @@ def load_workbook(
     except FileNotFoundError as exc:
         raise WorkbookFormatError(f"The workbook was not found:\n{path}") from exc
     except ValueError as exc:
+        try:
+            available = "\n".join(f"  - {name}" for name in list_sheet_names(path))
+            tabs = f"\n\nThe tabs in this workbook are:\n{available}"
+        except Exception:
+            tabs = ""
         raise WorkbookFormatError(
-            f"Worksheet '{sheet}' could not be read from:\n{path}\n\n{exc}"
+            f"Worksheet '{sheet}' could not be read from:\n{path}\n\n{exc}{tabs}"
         ) from exc
 
     if raw.empty or raw.shape[1] < 2:
@@ -2380,10 +2411,58 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
             output_var.set(selected)
 
     ttk.Label(run_tab, text="Excel workbook").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-    ttk.Entry(run_tab, textvariable=excel_var).grid(row=0, column=1, sticky="ew", pady=4)
+    excel_entry = ttk.Entry(run_tab, textvariable=excel_var)
+    excel_entry.grid(row=0, column=1, sticky="ew", pady=4)
     ttk.Button(run_tab, text="Browse...", command=browse_workbook).grid(
         row=0, column=2, padx=(8, 0), pady=4)
-    labelled_entry(run_tab, 1, "Worksheet", sheet_var, "name, or a zero-based number", width=24)
+    ttk.Label(run_tab, text="Worksheet").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+    sheet_combo = ttk.Combobox(run_tab, textvariable=sheet_var, width=34)
+    sheet_combo.grid(row=1, column=1, sticky="w", pady=4)
+    sheet_status = ttk.Label(run_tab, text="", foreground="#555555")
+    sheet_status.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=4)
+
+    listed_workbook: list[str] = []
+
+    def refresh_sheet_list(force: bool = False) -> None:
+        """Fill the worksheet dropdown with the tabs in the chosen workbook.
+
+        The list is rebuilt whenever the workbook changes, so the tab is picked
+        rather than typed. When the workbook cannot be read the dropdown stays
+        editable, so a name can still be entered by hand.
+        """
+        path_text = excel_var.get().strip().strip('"')
+        if not force and listed_workbook and listed_workbook[0] == path_text:
+            return
+        listed_workbook.clear()
+
+        def editable(message: str) -> None:
+            sheet_combo.configure(values=(), state="normal")
+            sheet_status.configure(text=message)
+
+        if not path_text:
+            editable("Choose a workbook to list its tabs.")
+            return
+        workbook = Path(path_text).expanduser()
+        if not workbook.is_file():
+            editable("Workbook not found - the tab name can be typed instead.")
+            return
+        try:
+            names = list_sheet_names(workbook)
+        except Exception as exc:
+            editable(f"Tabs could not be listed ({exc.__class__.__name__}) - type the name instead.")
+            return
+        if not names:
+            editable("This workbook has no worksheets.")
+            return
+        listed_workbook.append(path_text)
+        sheet_combo.configure(values=names, state="readonly")
+        sheet_var.set(resolve_sheet_choice(names, sheet_var.get()))
+        sheet_status.configure(
+            text=f"{len(names)} tab{'' if len(names) == 1 else 's'} in this workbook.")
+
+    # Watching the variable catches every way the path can change - the Browse
+    # dialog, typing, pasting - where a focus or Return binding would miss some.
+    excel_var.trace_add("write", lambda *_args: refresh_sheet_list())
     ttk.Label(run_tab, text="Output folder").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
     ttk.Entry(run_tab, textvariable=output_var).grid(row=2, column=1, sticky="ew", pady=4)
     ttk.Button(run_tab, text="Browse...", command=browse_output).grid(
@@ -2686,6 +2765,7 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                 variable.set(defaults[section][key])
         for key in MODULE_KEYS:
             module_vars[key].set(defaults["modules"][key])
+        refresh_sheet_list(force=True)
         write_check_output("")
 
     def check_and_run() -> None:
@@ -2719,6 +2799,7 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
 
     root.protocol("WM_DELETE_WINDOW", cancel)
     root.bind("<Escape>", lambda _event: cancel())
+    refresh_sheet_list(force=True)
     root.update_idletasks()
     root.geometry(
         f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}"

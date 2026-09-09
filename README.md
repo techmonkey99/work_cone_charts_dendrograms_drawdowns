@@ -23,7 +23,13 @@ python hedge_fund_analytics.py
 
 Running it with no arguments opens the settings window. Every option lives in
 that window, and the choices are saved to `hf_analytics_settings.json` beside
-the script, then reloaded next time. If the script's folder is read-only the
+the script, then reloaded next time.
+
+Once a workbook is chosen, the **Worksheet** box becomes a drop-down list of
+that workbook's tabs, so the name never has to be typed correctly. It keeps the
+tab you used last if the new workbook still has it, and otherwise selects the
+first tab. If the workbook cannot be opened - it is missing, or locked by Excel
+- the box stays typeable and says why. If the script's folder is read-only the
 file falls back to the per-user configuration folder, and the window shows
 which file is in use.
 
