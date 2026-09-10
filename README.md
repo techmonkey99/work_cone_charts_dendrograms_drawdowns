@@ -13,7 +13,8 @@ produced.
 | 4 - Portfolio risk allocation | Risk budget by cluster, the dendrogram with weight and risk in the margin, an add-or-trim chart, concentration measures, per-lookback PDFs and CSVs | Either layout, plus a weights row |
 
 Any combination of modules can run together, as long as the sheet's layout
-supports each one.
+supports each one. Whatever runs, a short written commentary is produced
+alongside the charts - see [The written commentary](#the-written-commentary).
 
 ## Install and run
 
@@ -41,6 +42,7 @@ saved file:
 python hedge_fund_analytics.py --check-only "C:\data\returns.xlsx"
 python hedge_fund_analytics.py "C:\data\returns.xlsx" --sheet "Raw Data" \
     --modules clustering,performance --output-dir "C:\data\output"
+python hedge_fund_analytics.py "C:\data\returns.xlsx" --no-commentary
 ```
 
 Command-line runs do not overwrite the saved settings, so they cannot change
@@ -178,8 +180,69 @@ and the run report:
   Turning it on applies a Geltner adjustment to funds with positive
   autocorrelation, which costs the window its first month.
 
+## The written commentary
+
+Every run also writes `commentary.docx` at the top of the output folder: a few
+pages explaining what each output is and how to read it, and then what this
+particular workbook shows, with the funds named. It covers whichever modules
+ran, in this order:
+
+* **Headline** - the half-dozen sentences for a reader who stops after the
+  first page.
+* **Where the risk is** - the largest block of risk and what sits in it, the
+  biggest contributors at fund level, and the positions carrying materially
+  more or less risk than their weight implies.
+* **Where funds could be added or trimmed** - the portfolio's own return per
+  unit of risk, then the held funds that clear that bar at the margin, the ones
+  that do not, and the unheld candidates that would.
+* **Anything else notable** - the effective number of bets, concentration of
+  risk against concentration of capital, clusters with room in them, cash or
+  gearing.
+* One section per other module that ran - funds running behind or ahead of what
+  was underwritten, what behaves like what, and the drawdown record.
+* **Coverage and caveats** - short track records, funds held but not covered by
+  the analysis window, exclusions, and the estimators the numbers came from.
+
+Modules 2 and 4 run over several lookbacks. The commentary is written on the
+longest one and then says where the shorter windows disagree, rather than
+repeating itself three times or averaging the three together.
+
+The explanations are the same in every run, since what a cone chart means does
+not change between runs. Everything else is read from the same objects the
+charts were drawn from, so the document and the pictures beside it cannot
+disagree. The headline chart of each section is embedded at the point it is
+discussed.
+
+The **Written commentary** tab controls it:
+
+* **Write the commentary document** - untick to skip it entirely.
+* **File format** - `auto` writes Word where `python-docx` is installed and
+  Markdown where it is not, and says which in the run report. `docx` insists on
+  Word and reports a missing package as an error; `markdown` always writes
+  Markdown.
+* **Put the headline charts in the document** - untick for a text-only file.
+  Charts are rendered for the document at its own resolution, so this works
+  whether or not the modules themselves are set to save PNGs.
+* **Name at most N funds in any one list** - longer lists are cut short, and
+  say how many were left out.
+* **Only mention gaps of N percentage points or more** - the threshold below
+  which a difference is treated as noise rather than reported as a finding.
+  Three points suits a book of twenty-odd funds; a concentrated book of eight
+  wants more.
+
+Module 4 supplies the risk and add-or-trim reading, so without a weights row
+the commentary describes how the funds have behaved but not how the book's risk
+is distributed between them, and it says so.
+
+The commentary is descriptive. It says what the arithmetic implies about the
+book as it stands over the window analysed - it does not know about capacity,
+liquidity, lock-ups, fees or last week's manager meeting, and it is not
+investment advice.
+
 ## Output
 
 Each run writes to a date-and-time sub-folder of the output folder (this can be
-switched off), with one sub-folder per module and a `run_report.txt` recording
-the workbook summary, what each module produced and the exact settings used.
+switched off), with one sub-folder per module, `commentary.docx`, a
+`commentary_charts` folder holding the pictures it embeds, and a
+`run_report.txt` recording the workbook summary, what each module produced and
+the exact settings used.

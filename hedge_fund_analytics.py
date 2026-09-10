@@ -15,6 +15,12 @@ single settings window.
                                      weights beside it, and a marginal
                                      add-or-trim chart. Needs a weights row.
 
+Every run also writes a short commentary document beside the charts, explaining
+what each output is and how to read it, and then what this particular workbook
+shows - where the risk sits, where funds could be added or trimmed, and
+anything else notable, with the funds named. It is a Word file where python-docx
+is installed and Markdown where it is not.
+
 ===============================================================================
 EXPECTED WORKBOOK LAYOUTS
 ===============================================================================
@@ -101,6 +107,8 @@ Required packages:
     pip install pandas numpy scipy matplotlib seaborn openpyxl
 Optional (interactive HTML line charts in module 3):
     pip install plotly
+Optional (the commentary as a Word document rather than Markdown):
+    pip install python-docx
 """
 
 from __future__ import annotations
@@ -226,6 +234,19 @@ def default_settings() -> dict[str, Any]:
         },
         "modules": {"cone": True, "clustering": True, "performance": True,
                     "allocation": False},
+        # A gap smaller than material_gap_pct is noise in an estimate made from
+        # sixty-odd monthly observations, and naming it would hand the reader a
+        # decision the data cannot support. It is a setting because a
+        # concentrated book of eight funds and a diversified one of forty do
+        # not have the same idea of what counts as material.
+        "commentary": {
+            "create_document": True,
+            "file_format": "auto",
+            "embed_charts": True,
+            "chart_dpi": 200,
+            "max_named_funds": 6,
+            "material_gap_pct": 3.0,
+        },
         "cone": {
             "use_risk_free": True,
             "use_predetermined_months": False,
@@ -409,6 +430,20 @@ def validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("Portfolio risk: image resolution must be at least 72 DPI.")
     if not any((allocation["create_pdf"], allocation["save_png"], allocation["save_csv"])):
         raise ValueError("Portfolio risk: select at least one output type (PDF, PNG or CSV).")
+
+    commentary = settings["commentary"]
+    if commentary["file_format"] not in {"auto", "docx", "markdown"}:
+        raise ValueError(
+            "Commentary: the file format must be auto, docx or markdown."
+        )
+    if int(commentary["chart_dpi"]) < 72:
+        raise ValueError("Commentary: embedded chart resolution must be at least 72 DPI.")
+    if int(commentary["max_named_funds"]) < 1:
+        raise ValueError("Commentary: at least one fund must be named in each list.")
+    if not 0 < float(commentary["material_gap_pct"]) < 100:
+        raise ValueError(
+            "Commentary: the materiality threshold must be between 0 and 100 percentage points."
+        )
 
     performance = settings["performance"]
     if int(performance["rolling_window_months"]) < 1:
@@ -787,9 +822,11 @@ def normalise_weights(weights: dict[str, float]) -> tuple[dict[str, float], list
             f"The weights add up to {invested * 100:.1f}%, so the book is geared. "
             "Risk figures are reported on that geared basis."
         )
-    if any(value < 0 for value in scaled.values()):
-        shorts = ", ".join(name for name, value in scaled.items() if value < 0)
-        notes.append(f"Negative weight(s) were found and kept as short positions: {shorts}.")
+    shorts = [_split_label(name)[1] for name, value in scaled.items() if value < 0]
+    if shorts:
+        notes.append(
+            f"{_plural(len(shorts), 'negative weight was', 'negative weights were')} found and "
+            f"kept as short positions: {_names(shorts)}.")
     return scaled, notes
 
 
@@ -1085,14 +1122,12 @@ def load_workbook(
         notes.extend(weight_notes)
         for fund in funds:
             fund.weight = scaled.get(fund.combined_label, 0.0)
-        unheld = [fund.combined_label for fund in funds if not fund.weight]
+        unheld = [fund.fund for fund in funds if not fund.weight]
         if unheld:
             notes.append(
-                f"{len(unheld)} fund(s) have no weight, so they are treated as candidates the "
-                "portfolio does not hold: "
-                + ", ".join(unheld[:6])
-                + ("..." if len(unheld) > 6 else "")
-                + "."
+                f"{_plural(len(unheld), 'fund has', 'funds have')} no weight, so they are "
+                "treated as candidates the portfolio does not hold: "
+                + _names(unheld) + "."
             )
 
     # Reindexing onto the complete calendar is what makes every rolling window
@@ -1175,6 +1210,47 @@ def unique_stem(stem: str, used: set[str]) -> str:
     return candidate
 
 
+def _names(values: Sequence[str], limit: int = 6) -> str:
+    """A readable list, truncated once it stops being readable."""
+    items = [str(value) for value in values]
+    if not items:
+        return "none"
+    if len(items) > limit:
+        shown, rest = items[:limit], len(items) - limit
+        return ", ".join(shown) + f" and {rest} other{'s' if rest > 1 else ''}"
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _trimmed(parts: Sequence[str], limit: int, separator: str = "; ") -> str:
+    """A list of phrases, with an honest tail when it is longer than the reader wants.
+
+    A sentence that counts nine funds and then names six reads as a mistake, so
+    the count of what was left out is part of the sentence rather than
+    something the reader has to notice.
+    """
+    items = list(parts)
+    if len(items) <= limit:
+        return separator.join(items)
+    rest = len(items) - limit
+    return separator.join(items[:limit]) + f"{separator}and {rest} other{'s' if rest > 1 else ''}"
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    return f"{count} {singular if count == 1 else (plural or singular + 's')}"
+
+
+def _fund_name(row: Any) -> str:
+    """The fund on its own where that is unambiguous, with its strategy where it is not."""
+    return str(getattr(row, "fund", getattr(row, "label", "")))
+
+
+def _split_label(label: str) -> tuple[str, str]:
+    strategy, _, fund = str(label).partition("::")
+    return (strategy, fund) if fund else ("", strategy)
+
+
 def format_percent(value: float, decimals: int = 1) -> str:
     return f"{value * 100:.{decimals}f}%" if np.isfinite(value) else "n/a"
 
@@ -1189,6 +1265,64 @@ def rolling_total_return(series: pd.Series, window: int) -> pd.Series:
     """Compounded return over a complete trailing window, via log returns."""
     log_returns = np.log1p(series.astype(float))
     return np.expm1(log_returns.rolling(window=window, min_periods=window).sum())
+
+
+# =============================================================================
+# Findings collected while the modules run
+#
+# The commentary document is written after every module has finished, and it
+# describes what those modules actually produced rather than recomputing the
+# analysis a second time. Each runner is handed an optional collector and drops
+# into it the few objects the write-up needs: the cluster analyses, the risk
+# decompositions, per-fund realised figures, and copies of the charts worth
+# embedding.
+#
+# The collector is optional everywhere, so a run with the commentary switched
+# off behaves exactly as it did before, and a module that fails part way
+# through still leaves whatever it had already recorded.
+# =============================================================================
+
+class RunFindings:
+    """What the modules recorded on the way past, for the written summary.
+
+    Charts are copied into an assets folder at the collector's own resolution
+    rather than read back from the module folders, because a module may be set
+    to write no PNGs at all and the document still needs a picture.
+    """
+
+    def __init__(self, assets_dir: Path, dpi: int = 200, embed_charts: bool = True) -> None:
+        self.assets_dir = assets_dir
+        self.dpi = int(dpi)
+        self.embed_charts = bool(embed_charts)
+        self.cone: list[dict[str, Any]] = []
+        self.cone_notes: list[str] = []
+        self.clusters: dict[str, ClusterAnalysis] = {}
+        self.cluster_exclusions: list[dict[str, Any]] = []
+        self.performance: list[dict[str, Any]] = []
+        self.performance_excluded: list[tuple[str, str, int, str]] = []
+        self.risk: list[PortfolioRisk] = []
+        self.charts: dict[str, Path] = {}
+
+    def capture(self, key: str, figure: plt.Figure) -> None:
+        """Save a copy of a figure for the document, if it wants one."""
+        if not self.embed_charts or key in self.charts:
+            return
+        try:
+            self.assets_dir.mkdir(parents=True, exist_ok=True)
+            path = self.assets_dir / f"{safe_file_stem(key)}.png"
+            figure.savefig(path, dpi=self.dpi, bbox_inches="tight")
+        except Exception:  # a missing picture must never fail a run
+            LOGGER.exception("Could not save the commentary chart %s", key)
+            return
+        self.charts[key] = path
+
+    def adopt(self, key: str, path: str | Path | None) -> None:
+        """Point the document at a chart a module has already written."""
+        if not self.embed_charts or key in self.charts or path is None:
+            return
+        candidate = Path(path)
+        if candidate.is_file():
+            self.charts[key] = candidate
 
 
 # =============================================================================
@@ -1474,7 +1608,8 @@ def make_drawdown_chart(
     return figure
 
 
-def run_cone_module(data: WorkbookData, options: dict[str, Any], output_dir: Path) -> list[str]:
+def run_cone_module(data: WorkbookData, options: dict[str, Any], output_dir: Path,
+                    findings: RunFindings | None = None) -> list[str]:
     """Create every module-1 chart, plus the compiled PDF when requested."""
     output_dir.mkdir(parents=True, exist_ok=True)
     log: list[str] = []
@@ -1510,6 +1645,25 @@ def run_cone_module(data: WorkbookData, options: dict[str, Any], output_dir: Pat
         stem = unique_stem(safe_file_stem(fund.fund), used_stems)
         images: dict[str, str | None] = {}
 
+        if findings is not None:
+            # The same excess-return basis the cone itself is drawn on, so the
+            # write-up cannot quote a number the chart disagrees with.
+            excess = arithmetic_excess_returns(returns, fund_risk_free)
+            realised_excess, realised_vol, realised_sharpe = annualise_stats(excess)
+            findings.cone.append({
+                "strategy": fund.strategy,
+                "fund": fund.fund,
+                "label": fund.label,
+                "months": int(len(returns.dropna())),
+                "start": returns.index.min(),
+                "end": returns.index.max(),
+                "expected_excess": fund.expected_excess,
+                "expected_vol": fund.expected_vol,
+                "realised_excess": realised_excess,
+                "realised_vol": realised_vol,
+                "realised_sharpe": realised_sharpe,
+            })
+
         if fund.expected_excess is None or fund.expected_vol is None:
             log.append(
                 f"{fund.label}: no cone chart, because row 3 or row 4 has no expected figure."
@@ -1520,6 +1674,8 @@ def run_cone_module(data: WorkbookData, options: dict[str, Any], output_dir: Pat
             images["cone"] = str(output_dir / f"{stem}_cone.png")
             figure.savefig(images["cone"], dpi=dpi, bbox_inches="tight")
             plt.close(figure)
+            if findings is not None:
+                findings.adopt(f"cone::{fund.label}", images["cone"])
 
         builders: list[tuple[str, str, Callable[[], plt.Figure | None]]] = [
             ("rolling", f"{stem}_rolling_{window}m.png",
@@ -1551,6 +1707,8 @@ def run_cone_module(data: WorkbookData, options: dict[str, Any], output_dir: Pat
     saved = sum(1 for charts in charts_by_strategy.values()
                 for entry in charts for path in entry["images"].values() if path)
     log.append(f"Saved {saved} chart image(s) to {output_dir}.")
+    if findings is not None:
+        findings.cone_notes.extend(log[:-1])
 
     if options["create_pdf"] and charts_by_strategy:
         pdf_path = output_dir / "All_Funds_Cones.pdf"
@@ -1926,7 +2084,7 @@ def _save_cluster_outputs(result: ClusterAnalysis, exclusions: int, options: dic
 
 
 def run_clustering_module(data: WorkbookData, options: dict[str, Any],
-                          output_dir: Path) -> list[str]:
+                          output_dir: Path, findings: RunFindings | None = None) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     log: list[str] = []
     timeframes = normalise_timeframes(options["timeframes"])
@@ -1988,6 +2146,13 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
                 log.append(f"All strategies [{timeframe_label(period)}]: skipped - {exc}")
                 continue
             _save_cluster_outputs(result, 0, options, pdfs[period], output_dir, all_strategies=True)
+            if findings is not None:
+                findings.clusters[timeframe_label(period)] = result
+                if findings.embed_charts:
+                    figure = plot_cluster_dendrogram(
+                        result, 0, options, int(options["all_strategies_label_wrap_width"]))
+                    findings.capture(f"dendrogram::{timeframe_label(period)}", figure)
+                    plt.close(figure)
             run_rows.append({
                 "strategy": "All Strategies Combined", "timeframe": timeframe_label(period),
                 "start": str(merged.index.min()), "end": str(merged.index.max()),
@@ -2004,6 +2169,9 @@ def run_clustering_module(data: WorkbookData, options: dict[str, Any],
         for period in timeframes:
             exclusions.extend(row for row in universes[period].exclusions
                               if row["strategy"] == strategy)
+
+    if findings is not None:
+        findings.cluster_exclusions.extend(exclusions)
 
     if options["save_csv"]:
         audit_columns = ["strategy", "fund", "timeframe", "reason", "available_months"]
@@ -2389,8 +2557,63 @@ def _performance_heatmaps(returns_by_name: dict[str, pd.Series], options: dict[s
     return frames
 
 
+def drawdown_records(returns_by_name: dict[str, pd.Series]) -> list[dict[str, Any]]:
+    """Each fund's worst drawdown, and where it stands against its high-water mark.
+
+    The figures are the ones the module's own drawdown charts are drawn from,
+    so the write-up and the chart cannot disagree. A fund still below its peak
+    is reported with the number of months it has been there, because a shallow
+    drawdown that has lasted three years is a different problem from a deep one
+    that is already recovering.
+    """
+    # A drawdown this shallow is rounding rather than a position below water.
+    at_peak_tolerance = 0.0001
+
+    records: list[dict[str, Any]] = []
+    for name, returns in returns_by_name.items():
+        series = pd.to_numeric(returns, errors="coerce").dropna()
+        if series.empty:
+            continue
+        # The chart's own drawdowns are in percent; everything here is decimal,
+        # so that one threshold cannot mean two different things.
+        drawdowns = calculate_actual_drawdowns(calculate_price_index(series)).dropna() / 100.0
+        if drawdowns.empty:
+            continue
+        current = float(drawdowns.iloc[-1])
+
+        # Months since the fund was last at, or above, its high-water mark. A
+        # fund that has never regained its opening value has been under water
+        # for its whole life, which is not the same as nought months.
+        at_peak = drawdowns[drawdowns >= -at_peak_tolerance]
+        if current >= -at_peak_tolerance:
+            months_under = 0
+        elif at_peak.empty:
+            months_under = int(len(drawdowns))
+        else:
+            months_under = int((drawdowns.index > at_peak.index[-1]).sum())
+
+        annual_return, annual_vol, _ = annualise_stats(series)
+        strategy, _, fund = str(name).partition(" - ")
+        records.append({
+            "label": name,
+            "strategy": strategy if fund else "",
+            "fund": fund or str(name),
+            "months": int(len(series)),
+            "start": series.index.min(),
+            "end": series.index.max(),
+            "max_drawdown": float(drawdowns.min()),
+            "trough": drawdowns.idxmin(),
+            "current_drawdown": current,
+            "months_underwater": months_under,
+            "at_worst_now": bool(np.isclose(current, float(drawdowns.min()))),
+            "annual_return": annual_return,
+            "annual_vol": annual_vol,
+        })
+    return records
+
+
 def run_performance_module(data: WorkbookData, options: dict[str, Any],
-                           output_dir: Path) -> list[str]:
+                           output_dir: Path, findings: RunFindings | None = None) -> list[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     log: list[str] = []
     colormaps = _build_colormaps()
@@ -2524,6 +2747,20 @@ def run_performance_module(data: WorkbookData, options: dict[str, Any],
 
     if html_files:
         log.append(f"Saved {len(html_files)} interactive HTML line chart(s).")
+
+    if findings is not None:
+        findings.performance.extend(drawdown_records(all_returns))
+        findings.performance_excluded.extend(unique_excluded)
+        # Interactive line charts leave no picture behind and the PNGs are off
+        # by default, so the document takes its own copy of the two combined
+        # charts while the figures are still open.
+        wanted = {
+            f"NAV Line Plot - {combined_title}": "performance_nav",
+            f"Actual Drawdowns Heatmap - {combined_title}": "performance_drawdown_heatmap",
+        }
+        for figure, _, description in figures:
+            if description in wanted:
+                findings.capture(wanted[description], figure)
 
     figures.sort(key=lambda item: item[1])
     if options["create_pdf"] and figures:
@@ -2750,11 +2987,12 @@ def build_portfolio_risk(data: WorkbookData, returns: pd.DataFrame, analysis: Cl
     uncovered = held.drop(labels=[name for name in universe if name in held.index])
     if not uncovered.empty:
         notes.append(
-            f"{len(uncovered)} held fund(s) are not in this window, so every share below is of "
-            f"the other {(1.0 - uncovered.sum()) * 100:.1f}% of the book rather than all of it. "
-            "Left out: "
-            + ", ".join(f"{name} ({value * 100:.1f}%)" for name, value in uncovered.items())
-            + ". Run module 2 to see why, in its excluded_funds_audit.csv."
+            f"{_plural(len(uncovered), 'held fund is', 'held funds are')} not in this window, "
+            "so every share of risk and capital here is of the other "
+            f"{(1.0 - uncovered.sum()) * 100:.1f}% of the book rather than all of it. Left out: "
+            + _names([f"{_split_label(str(name))[1]} ({value * 100:.1f}%)"
+                      for name, value in uncovered.items()])
+            + ". Module 2's excluded_funds_audit.csv says why."
         )
 
     working = returns.astype(float)
@@ -3435,7 +3673,8 @@ def allocation_log_lines(risk: PortfolioRisk, options: dict[str, Any]) -> list[s
 
 
 def run_allocation_module(data: WorkbookData, options: dict[str, Any],
-                          cluster_options: dict[str, Any], output_dir: Path) -> list[str]:
+                          cluster_options: dict[str, Any], output_dir: Path,
+                          findings: RunFindings | None = None) -> list[str]:
     """Allocate the portfolio's risk across the clusters module 2 found.
 
     The clustering settings are shared with module 2 on purpose, so the two
@@ -3475,8 +3714,12 @@ def run_allocation_module(data: WorkbookData, options: dict[str, Any],
                 (plot_add_trim_scatter(risk, charting), "add_or_trim"),
                 (plot_concentration_summary(risk, charting), "concentration"),
             ):
+                if findings is not None:
+                    findings.capture(f"allocation::{label}::{suffix}", figure)
                 _save_allocation_figure(figure, stem.with_name(f"{stem.name}_{suffix}"),
                                         pdf, options)
+        if findings is not None:
+            findings.risk.append(risk)
 
         if options["save_csv"]:
             columns = ["strategy", "fund", "label", "cluster", "weight", "weight_share",
@@ -3496,6 +3739,1049 @@ def run_allocation_module(data: WorkbookData, options: dict[str, Any],
         log.append("Wrote the fund contributions, cluster budget and summary as CSV.")
     if not log:
         log.append("No lookback had enough common history to allocate risk over.")
+    return log
+
+
+# =============================================================================
+# The written commentary
+#
+# Every chart in this pack answers a question, and every chart assumes the
+# reader already knows which question. This section writes that down: a short
+# standing explanation of what each output is and how to read it, followed by
+# what this particular workbook actually says, with the funds named.
+#
+# The explanations are fixed text, because what a cone chart means does not
+# change between runs. The observations are not: they are read off the same
+# objects the charts were drawn from, so the document and the pictures beside
+# it can never disagree.
+#
+# The document is built as a list of blocks and rendered twice over - to Word
+# through python-docx, and to Markdown when python-docx is not installed. A
+# missing package downgrades the file format; it never costs the reader the
+# commentary itself.
+# =============================================================================
+
+COMMENTARY_STEM = "commentary"
+
+
+def _block(kind: str, **fields: Any) -> dict[str, Any]:
+    """One element of the document, in a form either renderer can take."""
+    return {"kind": kind, **fields}
+
+
+def _headline_of(items: Sequence[Any], months: Callable[[Any], tuple[int, int]]) -> Any | None:
+    """The lookback the commentary is written on: the longest, then the widest.
+
+    The longest window is the one least likely to be describing a single
+    market episode, so it carries the write-up and the shorter windows are
+    used only to say where they disagree with it.
+    """
+    return max(items, key=months) if items else None
+
+
+def headline_risk(findings: RunFindings) -> PortfolioRisk | None:
+    return _headline_of(findings.risk,
+                        lambda risk: (len(risk.returns), risk.returns.shape[1]))
+
+
+def headline_clusters(findings: RunFindings) -> ClusterAnalysis | None:
+    return _headline_of(list(findings.clusters.values()),
+                        lambda result: (len(result.returns), result.returns.shape[1]))
+
+
+def peer_sets(analysis: ClusterAnalysis) -> dict[str, frozenset[str]]:
+    """Each fund's cluster-mates, which is comparable across lookbacks when a cluster number is not."""
+    members = analysis.assignments.groupby("cluster")["fund"].apply(set).to_dict()
+    return {str(row.fund): frozenset(members[row.cluster] - {row.fund})
+            for row in analysis.assignments.itertuples()}
+
+
+def cluster_movers(findings: RunFindings, headline: ClusterAnalysis) -> list[tuple[str, str]]:
+    """Funds that sit with a different crowd over a different window.
+
+    Cluster numbers are not comparable between two runs of the linkage, so the
+    comparison is between the sets of funds a fund shares its cluster with. A
+    fund that keeps less than half its neighbours has not been placed
+    consistently, and any conclusion drawn about it is a conclusion about the
+    window rather than about the fund.
+    """
+    reference = peer_sets(headline)
+    moved: dict[str, list[str]] = {}
+    for label, analysis in findings.clusters.items():
+        if label == headline.timeframe_label:
+            continue
+        other = peer_sets(analysis)
+        for fund, peers in reference.items():
+            if fund not in other:
+                continue
+            union = peers | other[fund]
+            overlap = len(peers & other[fund]) / len(union) if union else 1.0
+            if overlap < 0.5:
+                moved.setdefault(fund, []).append(label)
+    return [(_split_label(fund)[1] or fund, _names(labels, 3))
+            for fund, labels in sorted(moved.items())]
+
+
+def tightest_pairs(analysis: ClusterAnalysis, count: int = 3) -> list[tuple[str, str, float]]:
+    """The most closely correlated pairs, which are the portfolio's near-duplicates."""
+    matrix = analysis.correlation
+    pairs: list[tuple[str, str, float]] = []
+    for first in range(matrix.shape[0]):
+        for second in range(first + 1, matrix.shape[1]):
+            value = float(matrix.iat[first, second])
+            if np.isfinite(value):
+                pairs.append((str(matrix.index[first]), str(matrix.columns[second]), value))
+    pairs.sort(key=lambda item: -item[2])
+    return pairs[:count]
+
+
+# -----------------------------------------------------------------------------
+# The standing explanations
+#
+# These do not change between runs, because what a cone chart means does not
+# change between runs. They are kept here rather than in the chart footers so
+# that the reader who was not in the room gets the same explanation as the
+# reader who was.
+# -----------------------------------------------------------------------------
+
+EXPLAINERS: dict[str, list[str]] = {
+    "cone": [
+        "The cone charts test each fund against what it was underwritten to do. Row 3 of the "
+        "workbook holds the annualised excess return the fund is expected to earn and row 4 the "
+        "volatility it is expected to earn it with. Those two numbers imply a range of cumulative "
+        "excess returns over time - narrow at the start, widening with the square root of elapsed "
+        "months - and that range is the cone. The fund's own cumulative excess return over the "
+        "risk-free rate is drawn through it.",
+        "A line inside the cone means the fund is doing roughly what it said it would, at roughly "
+        "the risk it said it would take. A line that leaves the bottom of the cone is a shortfall "
+        "against the case for owning it, and one that leaves the top is not automatically good "
+        "news: it usually means the fund is running more risk than row 4 assumed, which the "
+        "rolling volatility panel beside it will show. The rolling total return, rolling Sharpe "
+        "and drawdown charts on the same page put that path in context - whether a shortfall came "
+        "from one bad quarter or from a slow bleed, and whether the fund's risk-adjusted return "
+        "is trending up or down.",
+        "The cone is only as good as the two assumptions behind it. A fund given a generous "
+        "volatility assumption gets a wide cone and can sit comfortably inside it while "
+        "delivering very little, so the width of the cone is worth reading before the position of "
+        "the line within it.",
+    ],
+    "clustering": [
+        "The clustering output answers a question a list of strategy labels cannot: which of these "
+        "funds actually behave alike? The heatmap shows the correlation of every pair of funds "
+        "over the window. The dendrogram beside it groups the funds by how similar their monthly "
+        "return patterns are, joining the closest pair first and working up until every fund is on "
+        "one tree.",
+        "Read the dendrogram from the leaves upward. The height at which two funds join is how "
+        "different they are: funds joining near the bottom are near-substitutes for one another, "
+        "and a branch that only joins the rest of the tree near the top is genuinely doing "
+        "something else. Cutting the tree at a chosen number of clusters turns that picture into "
+        "the groups used everywhere else in this pack. A cluster is a statement about behaviour "
+        "over this window, not about a fund's stated strategy - two funds sitting in different "
+        "strategy buckets in the workbook can quite legitimately land in the same cluster, and "
+        "that is usually the most useful thing on the chart.",
+        "Correlation measured over one window is not a stable quantity, and a short window is "
+        "noisier than a long one, which is why several lookbacks are produced rather than one. "
+        "Funds without enough common history are left out of the clustering altogether rather "
+        "than being compared on a handful of months; they are listed with their reason in the "
+        "exclusion audit, and they are not represented anywhere on these charts.",
+    ],
+    "performance": [
+        "The performance and drawdown output is the record of what actually happened, without any "
+        "assumption attached. The NAV lines rebase every fund to 100 at the start of the window "
+        "so that paths can be compared on one axis. The drawdown lines show how far each fund is "
+        "below its own high-water mark at every point, which is the number an investor actually "
+        "experiences.",
+        "The heatmaps put funds on one axis and months on the other. Read them down a column "
+        "rather than along a row: a column that turns dark across many funds at once is a shared "
+        "shock, and it is where the correlations from the clustering section stop being an "
+        "abstraction. Reading along a row shows whether a fund's difficulty was its own. The "
+        "rolling performance and rolling risk-adjusted-return heatmaps do the same for returns "
+        "and for return per unit of volatility over the trailing window.",
+        "Two limits are worth holding in mind. A drawdown depends on when the window starts, so a "
+        "fund whose worst period sits just before the window looks better here than it deserves. "
+        "And monthly data cannot see inside a month, so every drawdown on these charts is the "
+        "month-end path and understates what was live at the time.",
+    ],
+    "allocation": [
+        "Weight is not risk. Three managed-futures funds at 5% each are a smaller block of risk "
+        "than their 15% of the book suggests, because they diversify one another; three "
+        "multi-strategy funds at 5% each are a larger one. This section splits the portfolio's "
+        "volatility across the clusters from the previous section, so a cluster on these charts "
+        "is the same cluster on that dendrogram.",
+        "The decomposition is the standard one. Each fund's marginal contribution is how much the "
+        "portfolio's volatility moves for the next pound put into it, and its component "
+        "contribution is that marginal figure multiplied by what is already held. Those "
+        "components add up to the portfolio's volatility exactly, so they can be grouped by "
+        "cluster with nothing left over, and a cluster's multiplier is simply its share of the "
+        "risk divided by its share of the capital. Above 1 it is carrying more risk than money.",
+        "The add-or-trim chart plots each fund's marginal contribution to risk against the return "
+        "it is expected to earn. The diagonal is the portfolio's own return per unit of risk: a "
+        "fund above the line improves that ratio at the margin, a fund below it is being paid "
+        "less than the risk it adds, and the portfolio itself sits on the line by construction. "
+        "Funds drawn as open rings are not held, so a candidate can be judged on the same axes "
+        "before it is bought. These are statements about the maths of the current book over one "
+        "window, not recommendations - a fund below the line may be held for a reason this "
+        "arithmetic does not see, such as capacity, liquidity or a view about the next regime.",
+    ],
+}
+
+HOW_TO_READ = [
+    "This document is written alongside the charts in the same output folder, and it is not a "
+    "substitute for them. Each section explains what its output is and how to read it, and then "
+    "says what this particular workbook shows, naming the funds involved. The explanations are "
+    "the same in every run; the observations are read from the same data the charts were drawn "
+    "from.",
+    "Everything here is descriptive. The figures come from the monthly returns in the workbook "
+    "over the lookbacks chosen for this run, using the estimators named at the end of the "
+    "document, and they describe how the book has behaved rather than how it will. Where a "
+    "sentence points at a decision - a cluster carrying more risk than its capital, a fund whose "
+    "next pound improves the portfolio's return per unit of risk - it is describing what the "
+    "arithmetic implies, on the assumption that the window is representative. It is not a "
+    "recommendation, and it does not know about capacity, liquidity, lock-ups, fees or a manager "
+    "meeting held last week.",
+]
+
+
+# -----------------------------------------------------------------------------
+# What this workbook says
+# -----------------------------------------------------------------------------
+
+def risk_observations(risk: PortfolioRisk, options: dict[str, Any],
+                      gap: float, limit: int) -> tuple[list[str], list[str], list[str]]:
+    """Where the risk sits, what could be added or trimmed, and what else stands out."""
+    funds = risk.funds
+    held = funds[funds["weight"] != 0]
+    clusters = risk.clusters
+
+    where: list[str] = []
+    top_cluster = clusters.iloc[0]
+    members = funds[funds["cluster"] == top_cluster.cluster].sort_values(
+        "risk_share", ascending=False)
+    where.append(
+        f"The largest single block of risk is cluster C{int(top_cluster.cluster)} "
+        f"({top_cluster.label}), which carries {format_percent(top_cluster.risk_share)} of the "
+        f"portfolio's volatility on {format_percent(top_cluster.weight_share)} of its capital"
+        + (f" - {top_cluster.risk_multiplier:.2f} times its weight"
+           if np.isfinite(top_cluster.risk_multiplier) else "")
+        + ". Its holdings are "
+        + _names([_fund_name(row) for row in members.itertuples() if row.weight], limit) + "."
+    )
+    ranked = held.nlargest(min(3, len(held)), "risk_share")
+    where.append(
+        "The three largest contributors at fund level are "
+        + "; ".join(
+            f"{_fund_name(row)} at {format_percent(row.risk_share)} of the risk on "
+            f"{format_percent(row.weight_share)} of the capital"
+            for row in ranked.itertuples())
+        + f". Between them they account for {format_percent(ranked['risk_share'].sum())} of "
+          "the portfolio's volatility."
+    )
+    crowded = held[held["risk_share_gap"] >= gap].sort_values("risk_share_gap", ascending=False)
+    if not crowded.empty:
+        where.append(
+            "Positions carrying materially more risk than their weight implies: "
+            + _trimmed(
+                [f"{_fund_name(row)} (+{format_percent(row.risk_share_gap)})"
+                 for row in crowded.itertuples()], limit)
+            + ". These are the positions that are larger than they look on a weights sheet, "
+              "either because they are volatile on their own or because they move with the rest "
+              "of the book."
+        )
+    diversifying = held[held["risk_share_gap"] <= -gap].sort_values("risk_share_gap")
+    if not diversifying.empty:
+        where.append(
+            "Positions carrying materially less risk than their weight implies: "
+            + _trimmed(
+                [f"{_fund_name(row)} ({format_percent(row.risk_share_gap)})"
+                 for row in diversifying.itertuples()], limit)
+            + ". These are doing the diversifying work in the portfolio."
+        )
+    flag = float(options["risk_multiplier_flag"])
+    hot = clusters[clusters["risk_multiplier"] >= flag]
+    if len(hot) > 1:
+        where.append(
+            f"More than one cluster is running above the {flag:g}x crowding flag: "
+            + _names([f"C{int(row.cluster)} ({row.label}) at {row.risk_multiplier:.2f}x"
+                      for row in hot.itertuples()], limit)
+            + "."
+        )
+
+    # Add or trim. The diagonal on the chart is the portfolio's own return per
+    # unit of risk, so a fund clears it when its expected return exceeds its
+    # marginal risk multiplied by that ratio.
+    moves: list[str] = []
+    slope = risk.portfolio_return / risk.portfolio_vol if risk.portfolio_vol > 0 else np.nan
+    if np.isfinite(slope):
+        scored = funds.assign(
+            edge=funds["expected_return"] - slope * funds["marginal_risk"])
+        above_held = scored[(scored["weight"] != 0) & (scored["edge"] > 0)].sort_values(
+            "edge", ascending=False)
+        below_held = scored[(scored["weight"] != 0) & (scored["edge"] < 0)].sort_values("edge")
+        candidates = scored[(scored["weight"] == 0) & (scored["edge"] > 0)].sort_values(
+            "edge", ascending=False)
+        moves.append(
+            f"The portfolio earns {slope:.2f} of expected return for each unit of volatility it "
+            f"runs ({format_percent(risk.portfolio_return)} on "
+            f"{format_percent(risk.portfolio_vol)}). That ratio is the bar each fund is measured "
+            "against below: a fund clears it when its expected return is worth more than the "
+            "risk the next pound into it would add."
+        )
+        if not above_held.empty:
+            moves.append(
+                "Held funds where the next pound improves that ratio, best first: "
+                + _trimmed(
+                    [f"{_fund_name(row)} (currently {format_percent(row.weight)}, expected "
+                     f"{format_percent(row.expected_return)} against a marginal risk of "
+                     f"{format_percent(row.marginal_risk)})"
+                     for row in above_held.itertuples()], limit)
+                + "."
+            )
+        if not below_held.empty:
+            moves.append(
+                "Held funds being paid less than the risk they add, where trimming improves the "
+                "ratio: "
+                + _trimmed(
+                    [f"{_fund_name(row)} (currently {format_percent(row.weight)}, expected "
+                     f"{format_percent(row.expected_return)} against a marginal risk of "
+                     f"{format_percent(row.marginal_risk)})"
+                     for row in below_held.itertuples()], limit)
+                + ". Trimming the largest of these is the cheapest way to reduce portfolio "
+                  "volatility without giving up much expected return."
+            )
+        if not candidates.empty:
+            moves.append(
+                "Funds in the workbook that are not held and would clear the bar at the margin: "
+                + _trimmed(
+                    [f"{_fund_name(row)} (expected {format_percent(row.expected_return)}, "
+                     f"marginal risk {format_percent(row.marginal_risk)}, correlation to the "
+                     f"book {row.correlation_to_portfolio:.2f})"
+                     for row in candidates.itertuples()], limit)
+                + ". A low correlation to the book is what makes a candidate cheap to add, "
+                  "rather than a high expected return on its own."
+            )
+        unheld_below = scored[(scored["weight"] == 0) & (scored["edge"] <= 0)]
+        if not unheld_below.empty:
+            moves.append(
+                f"{_plural(len(unheld_below), 'unheld fund')} in the window would not clear the "
+                "bar on these numbers: " + _names(
+                    [_fund_name(row) for row in unheld_below.itertuples()], limit) + "."
+            )
+
+    notable: list[str] = [
+        f"The book behaves like {risk.effective_bets:.1f} independent positions, from "
+        f"{int((funds['weight'] != 0).sum())} holdings across {len(clusters)} clusters. Its "
+        f"diversification ratio is {risk.diversification_ratio:.2f}, meaning the funds' own "
+        f"volatilities, weighted and added up, come to {risk.diversification_ratio:.2f} times the "
+        f"{format_percent(risk.portfolio_vol)} the portfolio actually runs."
+    ]
+    top_five = funds.nlargest(min(5, len(funds)), "risk_share")["risk_share"].sum()
+    notable.append(
+        f"The five largest contributors hold {format_percent(top_five)} of the portfolio's risk. "
+        f"Concentration of risk measured on a Herfindahl basis is {risk.risk_concentration:.3f} "
+        f"against {risk.weight_concentration:.3f} for capital"
+        + (", so the risk is more concentrated than the weights sheet suggests."
+           if risk.risk_concentration > risk.weight_concentration
+           else ", so the weights are more concentrated than the risk they produce.")
+    )
+    quiet = clusters[clusters["risk_multiplier"] < 1.0]
+    if not quiet.empty:
+        notable.append(
+            "Clusters carrying less risk than capital: "
+            + _names([f"C{int(row.cluster)} ({row.label}) at {row.risk_multiplier:.2f}x"
+                      for row in quiet.itertuples()], limit)
+            + ". Room to add sits here before it sits anywhere else."
+        )
+    if risk.cash_weight > 0.0005:
+        notable.append(
+            f"{format_percent(risk.cash_weight)} of the book is in cash, which carries no risk "
+            "and is excluded from every share above."
+        )
+    elif risk.cash_weight < -0.0005:
+        notable.append(
+            f"The weights total {format_percent(1.0 - risk.cash_weight)}, which is read as "
+            f"{format_percent(-risk.cash_weight)} of gearing."
+        )
+    return where, moves, notable
+
+
+def cone_observations(records: list[dict[str, Any]], gap: float,
+                      limit: int) -> list[str]:
+    """Which funds are running behind, ahead of, or hotter than what was underwritten."""
+    rated = [row for row in records
+             if row["expected_excess"] is not None and np.isfinite(row["realised_excess"])]
+    lines: list[str] = []
+    if not rated:
+        lines.append(
+            "No fund in the window has an expected excess return on row 3, so no fund can be "
+            "measured against its own case. The rolling return, Sharpe and drawdown charts still "
+            "apply; the cones do not."
+        )
+        return lines
+
+    for row in rated:
+        row["shortfall"] = row["realised_excess"] - float(row["expected_excess"])
+    behind = sorted([row for row in rated if row["shortfall"] <= -gap],
+                    key=lambda row: row["shortfall"])
+    ahead = sorted([row for row in rated if row["shortfall"] >= gap],
+                   key=lambda row: -row["shortfall"])
+
+    if behind:
+        lines.append(
+            f"{_plural(len(behind), 'fund is', 'funds are')} running behind what was "
+            f"underwritten by more than {format_percent(gap)} a year, worst first: "
+            + _trimmed(
+                [f"{row['fund']} (expected {format_percent(row['expected_excess'])}, delivered "
+                 f"{format_percent(row['realised_excess'])} over "
+                 f"{_plural(row['months'], 'month')})"
+                 for row in behind], limit)
+            + "."
+        )
+    else:
+        lines.append(
+            f"No fund is more than {format_percent(gap)} a year behind its expected excess "
+            "return over its window."
+        )
+    if ahead:
+        lines.append(
+            "Ahead of expectations by the same margin: "
+            + _trimmed(
+                [f"{row['fund']} (expected {format_percent(row['expected_excess'])}, delivered "
+                 f"{format_percent(row['realised_excess'])})" for row in ahead], limit)
+            + ". Worth checking against realised volatility before it is read as skill."
+        )
+
+    hotter = [row for row in rated
+              if row["expected_vol"] is not None and np.isfinite(row["realised_vol"])
+              and row["realised_vol"] > float(row["expected_vol"]) * 1.25]
+    if hotter:
+        hotter.sort(key=lambda row: -(row["realised_vol"] / float(row["expected_vol"])))
+        lines.append(
+            "Running materially more volatility than row 4 assumed - at least a quarter more: "
+            + _trimmed(
+                [f"{row['fund']} ({format_percent(row['realised_vol'])} realised against "
+                 f"{format_percent(float(row['expected_vol']))} expected)" for row in hotter],
+                limit)
+            + ". A fund inside its cone on this much extra risk is not inside it on merit."
+        )
+    calmer = [row for row in rated
+              if row["expected_vol"] is not None and np.isfinite(row["realised_vol"])
+              and row["realised_vol"] < float(row["expected_vol"]) * 0.75]
+    if calmer:
+        lines.append(
+            "Running materially less volatility than assumed: "
+            + _names([f"{row['fund']} ({format_percent(row['realised_vol'])} against "
+                      f"{format_percent(float(row['expected_vol']))})" for row in calmer], limit)
+            + "."
+        )
+    missing = [row["fund"] for row in records if row["expected_excess"] is None]
+    if missing:
+        lines.append(
+            f"{_plural(len(missing), 'fund has', 'funds have')} no expected figures in the "
+            "workbook and so get no cone: " + _names(missing, limit) + "."
+        )
+    return lines
+
+
+def cluster_observations(headline: ClusterAnalysis, findings: RunFindings,
+                         limit: int) -> tuple[list[str], list[str]]:
+    """What the clustering shows on the headline window, and where the others disagree."""
+    assignments = headline.assignments
+    sizes = assignments.groupby("cluster")["fund"].apply(list)
+    lines = [
+        f"Over the {headline.timeframe_label} window, {headline.returns.shape[1]} funds with a "
+        f"complete common history split into {len(sizes)} clusters "
+        f"({headline.returns.index.min().strftime('%b %Y')} to "
+        f"{headline.returns.index.max().strftime('%b %Y')})."
+    ]
+    for cluster, members in sizes.items():
+        names = [_split_label(str(member))[1] for member in members]
+        strategies = sorted({_split_label(str(member))[0] for member in members})
+        mixed = (" - drawn from " + _names(strategies, 4) + ", so this grouping cuts across the "
+                 "workbook's own strategy labels") if len(strategies) > 1 else ""
+        lines.append(
+            f"C{int(cluster)} ({_plural(len(names), 'fund')}{mixed}): {_names(names, limit)}.")
+
+    pairs = tightest_pairs(headline)
+    if pairs:
+        lines.append(
+            "The most closely correlated pairs over this window are "
+            + "; ".join(f"{_split_label(first)[1]} and {_split_label(second)[1]} at "
+                        f"{value:.2f}" for first, second, value in pairs)
+            + ". A pair above about 0.8 is close to being one position held twice."
+        )
+
+    disagreement: list[str] = []
+    others = [label for label in findings.clusters if label != headline.timeframe_label]
+    if others:
+        movers = cluster_movers(findings, headline)
+        if movers:
+            disagreement.append(
+                "These funds sit with a materially different set of peers over the other "
+                "lookbacks, so their placement is a statement about the window rather than about "
+                "the fund: "
+                + "; ".join(f"{fund} (over {labels})" for fund, labels in movers[:limit])
+                + "."
+            )
+        else:
+            disagreement.append(
+                f"The grouping is stable: no fund changes the bulk of its cluster-mates between "
+                f"the {headline.timeframe_label} window and {_names(others, 3)}."
+            )
+        for label in others:
+            other = findings.clusters[label]
+            extra = other.returns.shape[1] - headline.returns.shape[1]
+            if extra > 0:
+                disagreement.append(
+                    f"The {label} window covers {_plural(extra, 'more fund')} than the "
+                    f"{headline.timeframe_label} window, because a shorter window asks less "
+                    "history of each fund, and nothing said above covers the difference."
+                )
+    return lines, disagreement
+
+
+def performance_observations(records: list[dict[str, Any]], limit: int) -> list[str]:
+    """The drawdown record: how deep, how long, and who is still in one."""
+    if not records:
+        return ["No fund had enough history to produce a drawdown record."]
+    lines: list[str] = []
+    deepest = sorted(records, key=lambda row: row["max_drawdown"])[:3]
+    lines.append(
+        "The deepest drawdowns over each fund's own history are "
+        + "; ".join(
+            f"{row['fund']} at {format_percent(row['max_drawdown'])} "
+            f"(trough {row['trough'].strftime('%b %Y')})"
+            for row in deepest)
+        + "."
+    )
+    underwater = sorted([row for row in records if row["current_drawdown"] < -0.005],
+                        key=lambda row: row["current_drawdown"])
+    if underwater:
+        lines.append(
+            f"{len(underwater)} of {len(records)} funds are below their high-water mark at the "
+            "end of the window: "
+            + _trimmed(
+                [f"{row['fund']} at {format_percent(row['current_drawdown'])} after "
+                 f"{_plural(row['months_underwater'], 'month')}"
+                 for row in underwater], limit)
+            + "."
+        )
+        stuck = [row for row in underwater if row["months_underwater"] >= 24]
+        if stuck:
+            lines.append(
+                "Underwater for two years or more: "
+                + _names([f"{row['fund']} ({row['months_underwater']} months)"
+                          for row in stuck], limit)
+                + ". A shallow drawdown that has lasted this long is a different problem from a "
+                  "deep one that is already recovering."
+            )
+        worst_now = [row for row in underwater if row["at_worst_now"]]
+        if worst_now:
+            lines.append(
+                "At the worst point of their recorded history right now: "
+                + _names([row["fund"] for row in worst_now], limit)
+                + "."
+            )
+    else:
+        lines.append("Every fund finished the window at or near its high-water mark.")
+    return lines
+
+
+# -----------------------------------------------------------------------------
+# Assembling the document
+# -----------------------------------------------------------------------------
+
+def build_commentary(data: WorkbookData, settings: dict[str, Any],
+                     findings: RunFindings) -> list[dict[str, Any]]:
+    """The whole document as blocks, ready for either renderer."""
+    options = settings["commentary"]
+    limit = int(options["max_named_funds"])
+    gap = float(options["material_gap_pct"]) / 100.0
+    modules = selected_modules(settings)
+    blocks: list[dict[str, Any]] = [
+        _block("title", text="Portfolio analytics commentary"),
+        _block("subtitle", text=(
+            f"{Path(str(data.path)).name} - {data.sheet} - "
+            f"{data.index[0]:%b %Y} to {data.index[-1]:%b %Y} - "
+            f"{len(data.funds)} funds across {len(data.strategies)} strategies - "
+            f"produced {_dt.datetime.now():%d %B %Y}")),
+    ]
+
+    risk = headline_risk(findings)
+    clusters = headline_clusters(findings)
+
+    where: list[str] = []
+    moves: list[str] = []
+    notable: list[str] = []
+    if risk is not None:
+        where, moves, notable = risk_observations(risk, settings["allocation"], gap, limit)
+
+    blocks.append(_block("heading", level=1, text="How to read this document"))
+    blocks.extend(_block("para", text=text) for text in HOW_TO_READ)
+    if risk is not None:
+        blocks.append(_block("para", text=(
+            f"The risk figures are written on the {risk.timeframe_label} window, which is the "
+            f"longest one this run could use ({len(risk.returns)} months to "
+            f"{risk.returns.index.max().strftime('%b %Y')}, "
+            f"{risk.returns.shape[1]} funds). Where a shorter window tells a different story it "
+            "is called out rather than averaged in.")))
+    elif "allocation" not in modules:
+        blocks.append(_block("note", text=(
+            "The portfolio risk module did not run, so this document describes how the funds have "
+            "behaved but not how the book's risk is distributed between them. Add a weights row "
+            "to the worksheet and tick module 4 to get the risk allocation, the add-or-trim "
+            "reading and the concentration measures.")))
+
+    # ---- Headline ---------------------------------------------------------
+    headline = headline_lines(findings, risk, gap)
+    if headline:
+        blocks.append(_block("heading", level=1, text="Headline"))
+        blocks.append(_block("bullets", items=headline))
+
+    # ---- Module 4: where the risk is --------------------------------------
+    if risk is not None:
+        blocks.append(_block("heading", level=1, text="Where the risk is"))
+        blocks.extend(_block("para", text=text) for text in EXPLAINERS["allocation"][:2])
+        blocks.append(_block("heading", level=2, text="What this portfolio shows"))
+        blocks.append(_block("table", headers=["Measure", "Value"],
+                            rows=[list(pair) for pair in concentration_lines(risk)]))
+        blocks.append(_block("bullets", items=where))
+        blocks.append(_block("image", key=f"allocation::{risk.timeframe_label}::cluster_risk_budget",
+                            caption=f"Cluster risk budget, {risk.timeframe_label}"))
+        blocks.append(_block("table",
+                            headers=["Cluster", "Funds", "Held", "Capital", "Risk", "Multiplier"],
+                            rows=[[f"C{int(row.cluster)} {row.label}", str(int(row.members)),
+                                   str(int(row.held)), format_percent(row.weight_share),
+                                   format_percent(row.risk_share),
+                                   f"{row.risk_multiplier:.2f}x"
+                                   if np.isfinite(row.risk_multiplier) else "not held"]
+                                  for row in risk.clusters.itertuples()]))
+
+        blocks.append(_block("heading", level=1, text="Where funds could be added or trimmed"))
+        blocks.append(_block("para", text=EXPLAINERS["allocation"][2]))
+        blocks.append(_block("bullets", items=moves))
+        blocks.append(_block("image", key=f"allocation::{risk.timeframe_label}::add_or_trim",
+                            caption=f"Marginal risk against expected return, "
+                                    f"{risk.timeframe_label}"))
+
+        blocks.append(_block("heading", level=1, text="Anything else notable"))
+        blocks.append(_block("bullets", items=notable))
+        blocks.append(_block("image", key=f"allocation::{risk.timeframe_label}::concentration",
+                            caption=f"Concentration, {risk.timeframe_label}"))
+
+        others = [item for item in findings.risk if item is not risk]
+        if others:
+            differences = lookback_differences(risk, others, gap, limit)
+            blocks.append(_block("heading", level=2, text="Where the other lookbacks disagree"))
+            blocks.append(_block("bullets", items=differences))
+
+    # ---- Module 1 ---------------------------------------------------------
+    if findings.cone:
+        blocks.append(_block("heading", level=1, text="Expected against actual"))
+        blocks.extend(_block("para", text=text) for text in EXPLAINERS["cone"])
+        blocks.append(_block("heading", level=2, text="What this workbook shows"))
+        lines = cone_observations(findings.cone, gap, limit)
+        blocks.append(_block("bullets", items=lines))
+        worst = worst_cone_fund(findings.cone, gap)
+        if worst is not None:
+            blocks.append(_block("image", key=f"cone::{worst}",
+                                caption=f"{worst} against its expected range"))
+
+    # ---- Module 2 ---------------------------------------------------------
+    if clusters is not None:
+        blocks.append(_block("heading", level=1, text="What behaves like what"))
+        blocks.extend(_block("para", text=text) for text in EXPLAINERS["clustering"])
+        blocks.append(_block("heading", level=2, text="What this workbook shows"))
+        lines, disagreement = cluster_observations(clusters, findings, limit)
+        blocks.append(_block("bullets", items=lines))
+        blocks.append(_block("image", key=f"dendrogram::{clusters.timeframe_label}",
+                            caption=f"All strategies, {clusters.timeframe_label}"))
+        if disagreement:
+            blocks.append(_block("heading", level=2, text="Where the other lookbacks disagree"))
+            blocks.append(_block("bullets", items=disagreement))
+
+    # ---- Module 3 ---------------------------------------------------------
+    if findings.performance:
+        blocks.append(_block("heading", level=1, text="What actually happened"))
+        blocks.extend(_block("para", text=text) for text in EXPLAINERS["performance"])
+        blocks.append(_block("heading", level=2, text="What this workbook shows"))
+        blocks.append(_block("bullets",
+                            items=performance_observations(findings.performance, limit)))
+        blocks.append(_block("image", key="performance_drawdown_heatmap",
+                            caption="Actual drawdowns, all funds"))
+        blocks.append(_block("image", key="performance_nav",
+                            caption="NAV, all funds"))
+
+    # ---- Coverage ---------------------------------------------------------
+    blocks.append(_block("heading", level=1, text="Coverage and caveats"))
+    blocks.append(_block("bullets", items=coverage_notes(data, settings, findings, risk, limit)))
+    blocks.append(_block("note", text=(
+        "Produced automatically from the workbook named at the top of this document. The "
+        "observations are arithmetic on the monthly returns in it, over the windows and with the "
+        "estimators listed above. They describe the record, not the future, and they are not "
+        "investment advice.")))
+    return blocks
+
+
+def headline_lines(findings: RunFindings, risk: PortfolioRisk | None,
+                   gap: float) -> list[str]:
+    """The half-dozen sentences a reader who stops after the first page should have.
+
+    Deliberately written rather than assembled from the sections below, so that
+    the first page is a summary and not the same paragraphs twice.
+    """
+    lines: list[str] = []
+    if risk is not None:
+        held = risk.funds[risk.funds["weight"] != 0]
+        lines.append(
+            f"The book runs {format_percent(risk.portfolio_vol)} of volatility a year across "
+            f"{_plural(len(held), 'holding')}, and behaves like {risk.effective_bets:.1f} "
+            f"independent positions - so the {_plural(len(held), 'position')} on the weights "
+            f"sheet are worth rather fewer than that in risk terms.")
+        top = risk.clusters.iloc[0]
+        lines.append(
+            f"The largest block of risk is C{int(top.cluster)} ({top.label}), which holds "
+            f"{format_percent(top.risk_share)} of it on {format_percent(top.weight_share)} of "
+            "the capital"
+            + (f", {top.risk_multiplier:.2f} times its weight." if np.isfinite(top.risk_multiplier)
+               else "."))
+        if not held.empty:
+            largest = held.nlargest(1, "risk_share").iloc[0]
+            lines.append(
+                f"The single largest contributor is {largest['fund']}, at "
+                f"{format_percent(largest['risk_share'])} of the portfolio's risk on "
+                f"{format_percent(largest['weight_share'])} of its capital.")
+        slope = risk.portfolio_return / risk.portfolio_vol if risk.portfolio_vol > 0 else np.nan
+        if np.isfinite(slope):
+            scored = risk.funds.assign(
+                edge=risk.funds["expected_return"] - slope * risk.funds["marginal_risk"])
+            best = scored[scored["edge"] > 0].nlargest(1, "edge")
+            worst = scored[(scored["weight"] != 0) & (scored["edge"] < 0)].nsmallest(1, "edge")
+            parts: list[str] = []
+            if not best.empty:
+                row = best.iloc[0]
+                parts.append(
+                    f"the next pound is best spent on {row['fund']}"
+                    + ("" if row["weight"] else " (not currently held)"))
+            if not worst.empty:
+                parts.append(f"the position paying least for its risk is {worst.iloc[0]['fund']}")
+            if parts:
+                lines.append(
+                    f"On the portfolio's own return per unit of risk ({slope:.2f}): "
+                    + "; ".join(parts) + ". The add-or-trim section sets out the rest.")
+
+    clusters = headline_clusters(findings)
+    if risk is None and clusters is not None:
+        # With module 4 off there is no risk budget to lead with, so the
+        # grouping itself is the most useful thing on the first page.
+        sizes = clusters.assignments.groupby("cluster")["fund"].apply(list)
+        largest = max(sizes.items(), key=lambda item: len(item[1]))
+        pairs = tightest_pairs(clusters, 1)
+        opening = (f"Over the {clusters.timeframe_label} window, {clusters.returns.shape[1]} "
+                   "funds with a complete common history fall into "
+                   f"{_plural(len(sizes), 'behavioural group')}. ")
+        lines.append(opening + (
+            "No two of them group together at this cut, so on these returns each is doing "
+            "something distinct enough to stand on its own."
+            if len(largest[1]) < 2 else
+            f"The largest is C{int(largest[0])}, holding {_plural(len(largest[1]), 'fund')}: "
+            + _names([_split_label(str(member))[1] for member in largest[1]], 6) + "."))
+        if pairs:
+            first, second, value = pairs[0]
+            lines.append(
+                f"The closest pair over that window is {_split_label(first)[1]} and "
+                f"{_split_label(second)[1]}, correlated at {value:.2f}.")
+
+    if findings.cone:
+        rated = [row for row in findings.cone
+                 if row["expected_excess"] is not None and np.isfinite(row["realised_excess"])]
+        behind = [row for row in rated
+                  if row["realised_excess"] - float(row["expected_excess"]) <= -gap]
+        if behind:
+            worst_fund = min(behind,
+                             key=lambda row: row["realised_excess"] - float(row["expected_excess"]))
+            lines.append(
+                f"{_plural(len(behind), 'of the rated funds is', 'of the rated funds are')} "
+                f"running more than {format_percent(gap)} a year behind what they were "
+                f"underwritten to deliver, of {len(rated)} with an expected figure. The widest "
+                f"gap is {worst_fund['fund']}, at "
+                f"{format_percent(worst_fund['realised_excess'])} against "
+                f"{format_percent(float(worst_fund['expected_excess']))} expected.")
+
+    if findings.performance:
+        underwater = [row for row in findings.performance if row["current_drawdown"] < -0.005]
+        deepest = min(findings.performance, key=lambda row: row["max_drawdown"])
+        lines.append(
+            f"{len(underwater)} of {len(findings.performance)} funds end the window below their "
+            f"high-water mark. The deepest drawdown on record is {deepest['fund']} at "
+            f"{format_percent(deepest['max_drawdown'])}.")
+    return lines
+
+
+def worst_cone_fund(records: list[dict[str, Any]], gap: float) -> str | None:
+    """The fund whose picture is worth putting in front of the reader."""
+    rated = [row for row in records
+             if row["expected_excess"] is not None and np.isfinite(row["realised_excess"])]
+    if not rated:
+        return None
+    worst = min(rated, key=lambda row: row["realised_excess"] - float(row["expected_excess"]))
+    if worst["realised_excess"] - float(worst["expected_excess"]) > -gap:
+        return None
+    return str(worst["label"])
+
+
+def lookback_differences(headline: PortfolioRisk, others: Sequence[PortfolioRisk],
+                         gap: float, limit: int) -> list[str]:
+    """Where a shorter window would change the reading above."""
+    lines: list[str] = []
+    for other in others:
+        parts: list[str] = []
+        vol_gap = other.portfolio_vol - headline.portfolio_vol
+        if abs(vol_gap) >= 0.01:
+            parts.append(
+                f"portfolio volatility is {format_percent(other.portfolio_vol)} rather than "
+                f"{format_percent(headline.portfolio_vol)}")
+        if abs(other.effective_bets - headline.effective_bets) >= 0.5:
+            parts.append(
+                f"the book behaves like {other.effective_bets:.1f} independent positions rather "
+                f"than {headline.effective_bets:.1f}")
+
+        # Cluster numbers are not comparable between two runs of the linkage,
+        # so the comparison that survives is at fund level.
+        left = headline.funds.set_index("label")["risk_share"]
+        right = other.funds.set_index("label")["risk_share"]
+        shared = left.index.intersection(right.index)
+        moved = (right[shared] - left[shared]).sort_values(key=abs, ascending=False)
+        moved = moved[moved.abs() >= gap]
+        if not moved.empty:
+            parts.append(
+                "the biggest changes in risk share are "
+                + "; ".join(
+                    f"{_split_label(str(name))[1]} "
+                    f"({format_percent(left[name])} to {format_percent(right[name])})"
+                    for name in moved.index[:limit]))
+        missing = len(left.index.difference(right.index))
+        extra = len(right.index.difference(left.index))
+        if extra or missing:
+            parts.append(
+                f"it covers {other.returns.shape[1]} funds rather than "
+                f"{headline.returns.shape[1]}")
+        lines.append(
+            f"Over {other.timeframe_label}: " + ("; ".join(parts) if parts else
+                                                 "nothing material changes") + ".")
+    return lines
+
+
+def coverage_notes(data: WorkbookData, settings: dict[str, Any], findings: RunFindings,
+                   risk: PortfolioRisk | None, limit: int) -> list[str]:
+    """What the numbers above do not cover, and what shaped them."""
+    lines: list[str] = []
+    lines.append(
+        f"The workbook holds {len(data.funds)} funds across {len(data.strategies)} strategies, "
+        f"with monthly returns from {data.index[0]:%b %Y} to {data.index[-1]:%b %Y} "
+        f"({len(data.index)} months).")
+
+    histories = sorted(((len(fund.returns.dropna()), fund.fund) for fund in data.funds))
+    short = [f"{name} ({months} months)" for months, name in histories[:limit] if months < 36]
+    if short:
+        lines.append(
+            "Shortest track records, where every estimate is least reliable: "
+            + _names(short, limit) + ".")
+
+    if findings.cluster_exclusions:
+        reasons: dict[str, set[str]] = {}
+        for row in findings.cluster_exclusions:
+            reasons.setdefault(str(row.get("reason", "unstated")), set()).add(str(row.get("fund")))
+        for reason, names in sorted(reasons.items()):
+            lines.append(
+                f"Left out of the clustering ({reason}): " + _names(sorted(names), limit) + ".")
+
+    if findings.performance_excluded:
+        names = sorted({entry[0].split(" - ", 1)[-1] for entry in findings.performance_excluded})
+        lines.append(
+            "Left off the line charts for want of history: " + _names(names, limit) + ".")
+
+    if risk is not None:
+        lines.extend(risk.notes)
+    if data.notes:
+        lines.extend(f"Data note: {note}" for note in data.notes)
+
+    clustering = settings["clustering"]
+    lines.append(
+        "Clustering settings: "
+        f"{clustering['correlation_method']} correlation, {clustering['linkage_method']} linkage, "
+        f"cut into at most {clustering['max_clusters']} clusters, over "
+        f"{_names([timeframe_label(period) for period in normalise_timeframes(clustering['timeframes'])], 4)}.")
+    if risk is not None:
+        allocation = settings["allocation"]
+        estimator = ("Ledoit-Wolf shrinkage" if allocation["covariance_method"] == "ledoit_wolf"
+                     else "sample covariance")
+        detail = (f" (intensity {risk.shrinkage:.2f})"
+                  if allocation["covariance_method"] == "ledoit_wolf"
+                  and np.isfinite(risk.shrinkage) else "")
+        lines.append(
+            f"Risk settings: {estimator}{detail}; expected returns taken as the "
+            f"{risk.return_basis}; return smoothing "
+            + ("reversed for funds showing positive autocorrelation, which raises volatility and "
+               "correlation" if allocation["unsmooth_returns"] else "left as reported, so stale "
+               "monthly marks understate volatility and correlation")
+            + ".")
+    return lines
+
+
+# -----------------------------------------------------------------------------
+# Rendering
+#
+# One document, two renderers. Word is what the reader asked for; Markdown is
+# what they get when python-docx is not installed, which on a locked-down
+# machine is a real possibility and not a reason to lose the write-up.
+# -----------------------------------------------------------------------------
+
+def render_markdown(blocks: Sequence[dict[str, Any]], path: Path,
+                    findings: RunFindings) -> None:
+    lines: list[str] = []
+    for item in blocks:
+        kind = item["kind"]
+        if kind == "title":
+            lines += [f"# {item['text']}", ""]
+        elif kind == "subtitle":
+            lines += [f"*{item['text']}*", ""]
+        elif kind == "heading":
+            lines += ["#" * (int(item["level"]) + 1) + f" {item['text']}", ""]
+        elif kind == "para":
+            lines += [item["text"], ""]
+        elif kind == "note":
+            lines += [f"> {item['text']}", ""]
+        elif kind == "bullets":
+            lines += [f"* {text}" for text in item["items"]] + [""]
+        elif kind == "table":
+            lines += ["| " + " | ".join(item["headers"]) + " |",
+                      "| " + " | ".join("---" for _ in item["headers"]) + " |"]
+            lines += ["| " + " | ".join(str(cell) for cell in row) + " |"
+                      for row in item["rows"]] + [""]
+        elif kind == "image":
+            picture = findings.charts.get(item["key"])
+            if picture is not None:
+                relative = os.path.relpath(picture, path.parent).replace(os.sep, "/")
+                lines += [f"![{item['caption']}]({relative})", "",
+                          f"*{item['caption']}*", ""]
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def render_docx(blocks: Sequence[dict[str, Any]], path: Path, findings: RunFindings) -> None:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor
+
+    document = Document()
+    normal = document.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(10.5)
+    normal.paragraph_format.space_after = Pt(8)
+
+    for item in blocks:
+        kind = item["kind"]
+        if kind == "title":
+            heading = document.add_heading(item["text"], level=0)
+            heading.paragraph_format.space_after = Pt(2)
+        elif kind == "subtitle":
+            paragraph = document.add_paragraph(item["text"])
+            run = paragraph.runs[0]
+            run.italic = True
+            run.font.size = Pt(9.5)
+            run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+        elif kind == "heading":
+            document.add_heading(item["text"], level=int(item["level"]))
+        elif kind == "para":
+            document.add_paragraph(item["text"])
+        elif kind == "note":
+            paragraph = document.add_paragraph(item["text"])
+            run = paragraph.runs[0]
+            run.italic = True
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+        elif kind == "bullets":
+            for text in item["items"]:
+                document.add_paragraph(text, style="List Bullet")
+        elif kind == "table":
+            table = document.add_table(rows=1, cols=len(item["headers"]))
+            table.style = "Light Grid Accent 1"
+            for cell, text in zip(table.rows[0].cells, item["headers"], strict=True):
+                cell.text = str(text)
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.bold = True
+            for row in item["rows"]:
+                cells = table.add_row().cells
+                for cell, text in zip(cells, row, strict=True):
+                    cell.text = str(text)
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.size = Pt(9)
+            document.add_paragraph()
+        elif kind == "image":
+            picture = findings.charts.get(item["key"])
+            if picture is None:
+                continue
+            try:
+                document.add_picture(str(picture), width=Inches(6.4))
+            except Exception:  # a picture Word will not take must not lose the text
+                LOGGER.exception("Could not embed %s", picture)
+                continue
+            document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            caption = document.add_paragraph(item["caption"])
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = caption.runs[0]
+            run.italic = True
+            run.font.size = Pt(8.5)
+            run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+
+    document.save(str(path))
+
+
+def write_commentary(data: WorkbookData, settings: dict[str, Any], findings: RunFindings,
+                     output_root: Path) -> list[str]:
+    """Write the commentary, in Word where that is possible and Markdown where it is not."""
+    options = settings["commentary"]
+    blocks = build_commentary(data, settings, findings)
+    wanted = str(options["file_format"])
+    have_docx = importlib.util.find_spec("docx") is not None
+    log: list[str] = []
+
+    if wanted in {"auto", "docx"} and not have_docx:
+        if wanted == "docx":
+            raise WorkbookFormatError(
+                "The commentary was asked for as a Word document, but python-docx is not "
+                "installed. Run 'pip install python-docx', or set the commentary format to "
+                "Markdown."
+            )
+        log.append(
+            "python-docx is not installed, so the commentary was written as Markdown instead of "
+            "Word. Run 'pip install python-docx' for a .docx file."
+        )
+
+    use_docx = have_docx and wanted in {"auto", "docx"}
+    path = output_root / f"{COMMENTARY_STEM}.{'docx' if use_docx else 'md'}"
+    try:
+        if use_docx:
+            render_docx(blocks, path, findings)
+        else:
+            render_markdown(blocks, path, findings)
+    except PermissionError:
+        log.append(
+            f"The commentary could not be written to {path}. Close the file if it is open in "
+            "another application."
+        )
+        return log
+
+    embedded = sum(1 for item in blocks
+                   if item["kind"] == "image" and item["key"] in findings.charts)
+    log.append(f"Commentary: {path}")
+    log.append(
+        f"{sum(1 for item in blocks if item['kind'] in {'para', 'bullets'})} passage(s) and "
+        f"{embedded} embedded chart(s)."
+    )
     return log
 
 
@@ -3553,25 +4839,49 @@ def run_analysis(settings: dict[str, Any], data: WorkbookData | None = None) -> 
         report.extend(f"  - {note}" for note in data.notes)
         report.append("")
 
+    # The commentary is written after every module has finished, from what the
+    # modules recorded on the way past. Collecting is cheap and the collector
+    # is inert when the document is switched off, so the modules are handed one
+    # either way rather than being run down two different paths.
+    commentary = settings["commentary"]
+    findings = RunFindings(
+        output_root / f"{COMMENTARY_STEM}_charts",
+        dpi=int(commentary["chart_dpi"]),
+        embed_charts=bool(commentary["create_document"]) and bool(commentary["embed_charts"]),
+    )
+
     # Module 4 is handed the clustering settings as well as its own, so its
     # clusters are always the ones module 2 drew.
-    runners: dict[str, Callable[[WorkbookData, dict[str, Any], Path], list[str]]] = {
-        "cone": lambda book, chosen, folder: run_cone_module(book, chosen["cone"], folder),
-        "clustering": lambda book, chosen, folder: run_clustering_module(
-            book, chosen["clustering"], folder),
-        "performance": lambda book, chosen, folder: run_performance_module(
-            book, chosen["performance"], folder),
-        "allocation": lambda book, chosen, folder: run_allocation_module(
-            book, chosen["allocation"], chosen["clustering"], folder),
+    runners: dict[str, Callable[[WorkbookData, dict[str, Any], Path, RunFindings], list[str]]] = {
+        "cone": lambda book, chosen, folder, found: run_cone_module(
+            book, chosen["cone"], folder, found),
+        "clustering": lambda book, chosen, folder, found: run_clustering_module(
+            book, chosen["clustering"], folder, found),
+        "performance": lambda book, chosen, folder, found: run_performance_module(
+            book, chosen["performance"], folder, found),
+        "allocation": lambda book, chosen, folder, found: run_allocation_module(
+            book, chosen["allocation"], chosen["clustering"], folder, found),
     }
     for key in selected_modules(settings):
         report.append(f"--- {MODULE_TITLES[key]} ---")
         LOGGER.info("Running %s", MODULE_TITLES[key])
         try:
             report.extend(f"  {line}" for line in
-                          runners[key](data, settings, output_root / MODULE_FOLDERS[key]))
+                          runners[key](data, settings, output_root / MODULE_FOLDERS[key],
+                                       findings))
         except Exception as exc:  # keep the other modules going, and say what failed
             LOGGER.exception("%s failed", MODULE_TITLES[key])
+            report.append(f"  FAILED: {exc}")
+        report.append("")
+
+    if commentary["create_document"]:
+        report.append("--- Written commentary ---")
+        LOGGER.info("Writing the commentary")
+        try:
+            report.extend(f"  {line}" for line in
+                          write_commentary(data, settings, findings, output_root))
+        except Exception as exc:  # the charts are the deliverable; the write-up is not
+            LOGGER.exception("The commentary failed")
             report.append(f"  FAILED: {exc}")
         report.append("")
 
@@ -3640,11 +4950,13 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
     cluster_tab = ttk.Frame(notebook, padding=12)
     performance_tab = ttk.Frame(notebook, padding=12)
     allocation_tab = ttk.Frame(notebook, padding=12)
+    commentary_tab = ttk.Frame(notebook, padding=12)
     notebook.add(run_tab, text="Workbook & modules")
     notebook.add(cone_tab, text=MODULE_TITLES["cone"])
     notebook.add(cluster_tab, text=MODULE_TITLES["clustering"])
     notebook.add(performance_tab, text=MODULE_TITLES["performance"])
     notebook.add(allocation_tab, text=MODULE_TITLES["allocation"])
+    notebook.add(commentary_tab, text="Written commentary")
 
     def labelled_entry(parent: ttk.Frame, row: int, label: str, variable: tk.StringVar,
                        hint: str = "", width: int | None = None) -> None:
@@ -3961,6 +5273,37 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                     variable=boolean_var("allocation", "save_csv")).grid(
         row=0, column=2, sticky="w", padx=(20, 0))
 
+    # ---- Written commentary tab -------------------------------------------
+    commentary_tab.columnconfigure(1, weight=1)
+    ttk.Label(commentary_tab,
+              text=("Writes a short document beside the charts explaining what each output is, "
+                    "how to read it, and what this workbook actually shows - where the risk sits, "
+                    "where funds could be added or trimmed, and anything else notable, with the "
+                    "funds named. It describes whichever modules ran; module 4 supplies the risk "
+                    "and add-or-trim reading, so without a weights row the document covers "
+                    "behaviour but not the shape of the book."),
+              foreground="#555555", wraplength=860).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+    ttk.Checkbutton(commentary_tab, text="Write the commentary document",
+                    variable=boolean_var("commentary", "create_document")).grid(
+        row=1, column=0, columnspan=3, sticky="w", pady=3)
+    labelled_combo(commentary_tab, 2, "File format",
+                   string_var("commentary", "file_format"), ("auto", "docx", "markdown"),
+                   "auto = Word when python-docx is installed")
+    ttk.Checkbutton(commentary_tab,
+                    text="Put the headline charts in the document",
+                    variable=boolean_var("commentary", "embed_charts")).grid(
+        row=3, column=0, columnspan=3, sticky="w", pady=3)
+    labelled_entry(commentary_tab, 4, "Embedded chart resolution",
+                   string_var("commentary", "chart_dpi"), "DPI", width=10)
+    labelled_entry(commentary_tab, 5, "Name at most",
+                   string_var("commentary", "max_named_funds"),
+                   "funds in any one list, before it says \"and N others\"", width=10)
+    labelled_entry(commentary_tab, 6, "Only mention gaps of",
+                   string_var("commentary", "material_gap_pct"),
+                   "percentage points or more, so that noise is not reported as a finding",
+                   width=10)
+
     # ---- Collecting and validating ----------------------------------------
     def whole_number(section: str, key: str, label: str) -> int:
         text = variables[f"{section}.{key}"].get().strip()
@@ -3975,6 +5318,11 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
             drawdown_threshold = float(variables["cone.drawdown_threshold_pct"].get().strip())
         except ValueError as exc:
             raise ValueError("The cone drawdown threshold must be a number, such as 5.") from exc
+        try:
+            material_gap = float(variables["commentary.material_gap_pct"].get().strip())
+        except ValueError as exc:
+            raise ValueError(
+                "The commentary's materiality threshold must be a number, such as 3.") from exc
         try:
             crowding_flag = float(variables["allocation.risk_multiplier_flag"].get().strip())
         except ValueError as exc:
@@ -3991,6 +5339,16 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                 "stop_on_history_gaps": bool(variables["workbook.stop_on_history_gaps"].get()),
             },
             "modules": {key: bool(module_vars[key].get()) for key in MODULE_KEYS},
+            "commentary": {
+                "create_document": bool(variables["commentary.create_document"].get()),
+                "file_format": variables["commentary.file_format"].get().strip(),
+                "embed_charts": bool(variables["commentary.embed_charts"].get()),
+                "chart_dpi": whole_number("commentary", "chart_dpi",
+                                          "The embedded chart resolution"),
+                "max_named_funds": whole_number("commentary", "max_named_funds",
+                                                "The number of funds to name"),
+                "material_gap_pct": material_gap,
+            },
             "cone": {
                 "use_risk_free": bool(variables["cone.use_risk_free"].get()),
                 "use_predetermined_months": period_mode.get() == "fixed",
@@ -4212,6 +5570,10 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
         help=("Comma-separated list from " + ", ".join(MODULE_KEYS)
               + ". Module 1 (cone) needs the cone layout."),
     )
+    parser.add_argument("--commentary", action=argparse.BooleanOptionalAction, default=None,
+                        help="Write the commentary document, or skip it")
+    parser.add_argument("--commentary-format", choices=("auto", "docx", "markdown"),
+                        help="Word where python-docx is installed (auto), or force one")
     parser.add_argument("--check-only", action="store_true",
                         help="Check the workbook format and stop, without producing anything")
     parser.add_argument("--gui", action=argparse.BooleanOptionalAction, default=None,
@@ -4236,6 +5598,10 @@ def apply_arguments(settings: dict[str, Any], arguments: argparse.Namespace) -> 
                 f"Choose from {', '.join(MODULE_KEYS)}."
             )
         settings["modules"] = {key: key in requested for key in MODULE_KEYS}
+    if arguments.commentary is not None:
+        settings["commentary"]["create_document"] = bool(arguments.commentary)
+    if arguments.commentary_format is not None:
+        settings["commentary"]["file_format"] = arguments.commentary_format
     return settings
 
 

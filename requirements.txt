@@ -9,3 +9,6 @@ openpyxl>=3.1
 # Optional: interactive HTML line charts in module 3. Without it, module 3
 # falls back to static charts automatically.
 plotly>=5.18
+# Optional: the written commentary as a Word document. Without it, the same
+# commentary is written as Markdown instead.
+python-docx>=1.1
