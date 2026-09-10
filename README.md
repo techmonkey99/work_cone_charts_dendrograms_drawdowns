@@ -10,6 +10,7 @@ produced.
 | 1 - Cone charts | Expected-vs-actual excess return cone, rolling total return with rolling volatility, rolling Sharpe, drawdown - plus a compiled PDF | Cone layout only |
 | 2 - Correlation & clustering | Correlation heatmaps, Ward dendrograms, cluster assignments, exclusion audit, per-lookback PDFs | Either layout |
 | 3 - Performance & drawdowns | NAV and drawdown lines (interactive HTML or static), rolling drawdown / performance / risk-adjusted-return heatmaps, combined PDF | Either layout |
+| 4 - Portfolio risk allocation | Risk budget by cluster, the dendrogram with weight and risk in the margin, an add-or-trim chart, concentration measures, per-lookback PDFs and CSVs | Either layout, plus a weights row |
 
 Any combination of modules can run together, as long as the sheet's layout
 supports each one.
@@ -65,6 +66,28 @@ expected volatility.
 
 **Plain layout** has no expected figures, so returns start on Excel row 3.
 
+**The weights row** is optional and works with either layout. Put `Weight` in
+column A of the row directly above the first month, and each fund's share of
+the portfolio in its own column. Everything below moves down one row, so the
+plain layout then starts on row 4 and the cone layout on row 6:
+
+| | A | B | C | D |
+| --- | --- | --- | --- | --- |
+| 1 | | Equity L/S | Equity L/S | Risk Free Rate |
+| 2 | | Alpha Capital | Bravo Partners | SONIA |
+| 3 | | 5.0% | 4.0% | |
+| 4 | | 8.0% | 10.0% | |
+| 5 | Weight | 6.0% | 4.0% | |
+| 6 | 31/01/2020 | 1.20% | 0.80% | 0.35% |
+
+Only module 4 reads it; the other three ignore it. Weights may be typed as
+percentages or as whole numbers, since their total tells the two apart, and the
+run report says which was assumed. A weight left blank means the fund is not
+held, which is how a candidate is measured before it is bought - those funds
+still appear on the add-or-trim chart. Weights totalling less than 100% leave
+the rest in cash, which carries no risk; more than 100% is read as gearing.
+Leave the risk-free column's weight blank.
+
 Other rules:
 
 * Returns must be entered as Excel percentages - format the cells as `%` so
@@ -103,6 +126,48 @@ one.
 Funds left out of module 2 or module 3 for having too short a track record are
 not errors. They are recorded with their reason in
 `excluded_funds_audit.csv` and on the excluded-funds page of module 3's PDF.
+
+## Module 4 - portfolio risk allocation
+
+Weight is not risk. Three managed-futures funds at 5% each are a smaller block
+of risk than their 15% of the book suggests, because they diversify one
+another; three multi-strategy funds at 5% each are a larger one. Module 4
+splits the portfolio's volatility across the clusters module 2 finds, so a
+cluster on these charts is the same cluster on that dendrogram, and it uses
+module 2's lookbacks, clustering method and cluster count.
+
+It produces four charts per lookback:
+
+* **Cluster risk budget** - each cluster's share of the capital against its
+  share of the risk, with the funds inside it, and a multiplier saying how much
+  risk it carries per unit of capital.
+* **The dendrogram with weight and risk in the margin** - the clustering
+  picture, with what the portfolio actually owns beside it.
+* **Add or trim** - each fund's marginal contribution to portfolio volatility
+  against its expected return. The diagonal is the portfolio's own return per
+  unit of risk: above it, the next pound improves that ratio; below it,
+  trimming does. Funds with no weight are drawn as open rings, so a candidate
+  can be judged before it is bought.
+* **Concentration** - portfolio volatility, the effective number of bets, the
+  diversification ratio, and every fund's gap between its share of the risk and
+  its share of the capital.
+
+The decomposition is the standard one: with weights `w` and covariance `S`, the
+portfolio's volatility is `sqrt(w'Sw)`, fund *i*'s marginal contribution is
+`(Sw)i / vol` and its component contribution is `wi` times that. Those
+components add up to the portfolio's volatility exactly, so they group by
+cluster with nothing left over.
+
+Two settings change the risk numbers, and both are named in the chart footers
+and the run report:
+
+* **Covariance estimator** - Ledoit-Wolf shrinkage by default, because sixty
+  months of twenty-odd funds is enough to estimate a covariance but not enough
+  to trust every entry of it. `sample` gives the plain sample covariance.
+* **Reverse return smoothing** - off by default. Monthly marks are stale,
+  especially in credit and event, which understates volatility and correlation.
+  Turning it on applies a Geltner adjustment to funds with positive
+  autocorrelation, which costs the window its first month.
 
 ## Output
 
