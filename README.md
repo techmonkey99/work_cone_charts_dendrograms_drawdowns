@@ -68,7 +68,10 @@ expected volatility.
 
 **The weights row** is optional and works with either layout. Put `Weight` in
 column A of the row directly above the first month, and each fund's share of
-the portfolio in its own column. Everything below moves down one row, so the
+the portfolio in its own column. `Current Position`, `Position`, `Allocation`,
+`Holding`, `% of Portfolio` and `% of NAV` are recognised as well, since a
+book's weights go by several names; anything else in that cell is refused and
+named in the message rather than guessed at. Everything below moves down one row, so the
 plain layout then starts on row 4 and the cone layout on row 6:
 
 | | A | B | C | D |
@@ -122,6 +125,12 @@ be incomplete:
 With either relaxed, the affected months are reported in the run report, and
 any rolling window covering them produces no value rather than a misleading
 one.
+
+A strategy needs two funds before it gets a correlation heatmap and dendrogram
+of its own, since one fund cannot be correlated with itself. It only needs one
+to appear on the all-strategies charts and in module 4's risk allocation, where
+it is correlated against every fund outside its strategy in the usual way - so
+a strategy holding a single fund is still part of the combined picture.
 
 Funds left out of module 2 or module 3 for having too short a track record are
 not errors. They are recorded with their reason in

@@ -44,10 +44,12 @@ PLAIN LAYOUT (modules 2, 3 and 4)
 
 OPTIONAL WEIGHTS ROW (required by module 4, ignored by the rest)
 
-A row with "Weight" in column A, directly above the first month, holding each
-fund's share of the portfolio. It works with either layout and pushes
-everything below it down one row, so a plain sheet then starts its months on
-row 4 and a cone sheet on row 6:
+A row labelled "Weight" in column A, directly above the first month, holding
+each fund's share of the portfolio. "Current Position", "Position",
+"Allocation", "Holding", "% of Portfolio" and "% of NAV" are accepted as well,
+since a book's weights go by several names. It works with either layout and
+pushes everything below it down one row, so a plain sheet then starts its
+months on row 4 and a cone sheet on row 6:
 
      A                    B                     C
  1   [any label]          Strategy name         Strategy name
@@ -156,8 +158,15 @@ RISK_FREE_PREFIX = "risk free"
 # The optional portfolio-weights row sits directly above the first month, and
 # is recognised by its own label in column A rather than by position alone, so
 # a row put in the wrong place is reported instead of being read as something
-# else.
-WEIGHTS_ROW_PREFIX = "weight"
+# else. Several names for the same row are accepted, because a book's weights
+# are as often called its current positions or its allocation. Anything else
+# there is still refused and named in the message, rather than being guessed
+# at: a row of numbers above the first month could as easily be assets under
+# management or a fee.
+WEIGHTS_ROW_PREFIXES = (
+    "weight", "current position", "position", "current allocation", "allocation",
+    "holding", "% of portfolio", "portfolio %", "% of nav", "nav %",
+)
 
 # A single month above this size is reported as unusual; above the hard limit it
 # is treated as a units error, because it almost always means the cells hold
@@ -178,11 +187,13 @@ LAYOUT_DESCRIPTIONS = {
 }
 
 WEIGHTS_ROW_DESCRIPTION = (
-    'Optional weights row - a row with "Weight" in column A, directly above the first month, '
-    "holding each fund's share of the portfolio. Everything below it moves down one row, so "
-    "the plain layout then starts its months on row 4 and the cone layout on row 6. A blank "
-    "weight means the fund is not held, which is how a candidate is measured before it is "
-    "bought. Module 4 needs this row; the other modules ignore it."
+    'Optional weights row - a row labelled "Weight" in column A, directly above the first '
+    "month, holding each fund's share of the portfolio. "
+    '"Current Position", "Allocation", "Holding" and "% of Portfolio" are accepted too. '
+    "Everything below it moves down one row, so the plain layout then starts its months on "
+    "row 4 and the cone layout on row 6. A blank weight means the fund is not held, which is "
+    "how a candidate is measured before it is bought. Module 4 needs this row; the other "
+    "modules ignore it."
 )
 
 
@@ -657,8 +668,8 @@ def detect_layout(raw: pd.DataFrame) -> tuple[Literal["cone", "plain"], int, int
 
     weights_row: int | None = None
     if first_date_row > 0:
-        candidate = _header_text(raw.iloc[first_date_row - 1], 0)
-        if candidate.lower().startswith(WEIGHTS_ROW_PREFIX):
+        candidate = _header_text(raw.iloc[first_date_row - 1], 0).strip().lower()
+        if candidate.startswith(WEIGHTS_ROW_PREFIXES):
             weights_row = first_date_row - 1
 
     header_rows = first_date_row if weights_row is None else weights_row
@@ -676,8 +687,9 @@ def detect_layout(raw: pd.DataFrame) -> tuple[Literal["cone", "plain"], int, int
         label = _header_text(raw.iloc[first_date_row - 1], 0)
         if label:
             stray = (
-                f"\n\nThe row above the first date has '{label}' in column A. If that row holds "
-                'portfolio weights, put "Weight" in column A so it is recognised as one.'
+                f"\n\nThe row above the first date has '{label}' in column A, which is not one "
+                "of the names a weights row is recognised by. If that row holds portfolio "
+                'weights, change column A to "Weight" and it will be read as one.'
             )
     raise WorkbookFormatError(
         f"The first date in column A is on Excel row {first_date_row + 1}, which matches "
@@ -1653,7 +1665,16 @@ def select_cluster_returns(
     timeframe: Timeframe,
     options: dict[str, Any],
     strategy: str,
+    minimum_funds: int = 2,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """The funds a strategy can contribute to one lookback, and why the rest cannot.
+
+    Two funds are needed to correlate a strategy with itself, which is what
+    minimum_funds defaults to. The combined, all-strategies view asks for one
+    instead: a fund that is the only one in its strategy still correlates
+    perfectly well with every fund outside it, and leaving it out would drop a
+    real holding from the picture.
+    """
     exclusions: list[dict[str, Any]] = []
     minimum_months = int(options["min_required_months"])
     counts = frame.notna().sum()
@@ -1685,7 +1706,7 @@ def select_cluster_returns(
                 "available_months": int(eligible[fund].notna().sum()),
             })
         eligible = eligible.loc[:, current]
-    if eligible.shape[1] < 2:
+    if eligible.shape[1] < minimum_funds:
         return eligible.iloc[0:0], exclusions
 
     if timeframe == "max":
@@ -1713,7 +1734,7 @@ def select_cluster_returns(
             })
         selected = selected.loc[:, varying]
 
-    if selected.shape[1] < 2 or len(selected) < minimum_months:
+    if selected.shape[1] < minimum_funds or len(selected) < minimum_months:
         return selected.iloc[0:0], exclusions
     return selected, exclusions
 
@@ -1750,10 +1771,17 @@ def build_cluster_universe(data: WorkbookData, options: dict[str, Any],
         exclusions.extend(excluded)
         counts[strategy] = len(excluded)
         selected[strategy] = chosen
-        if chosen.empty:
+
+        # The combined view takes one fund where a strategy's own chart needs
+        # two, so a strategy holding a single fund still reaches the
+        # all-strategies dendrogram and the portfolio's risk. The exclusions
+        # are the ones recorded above, which describe the same funds.
+        contributed, _ = select_cluster_returns(
+            strategy_frame, period, options, strategy, minimum_funds=1)
+        if contributed.empty:
             continue
-        renamed = chosen.copy()
-        renamed.columns = [f"{strategy}::{fund}" for fund in chosen.columns]
+        renamed = contributed.copy()
+        renamed.columns = [f"{strategy}::{fund}" for fund in contributed.columns]
         renamed_frames.append(renamed)
 
     combined = (
@@ -3729,7 +3757,7 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
                     "  (either layout)", variable=module_vars["performance"]).grid(
         row=2, column=0, sticky="w", pady=2)
     ttk.Checkbutton(modules_box, text=MODULE_TITLES["allocation"] +
-                    '  (either layout, plus a "Weight" row above the first month)',
+                    '  (either layout, plus a "Weight" or "Current Position" row)',
                     variable=module_vars["allocation"]).grid(
         row=3, column=0, sticky="w", pady=2)
 
@@ -3898,9 +3926,10 @@ def show_settings_window(settings: dict[str, Any], path: Path) -> dict[str, Any]
               text=("Allocates the portfolio's volatility across the clusters module 2 finds, so "
                     "the clusters here are the ones on that dendrogram. It uses module 2's "
                     "lookbacks, clustering method and cluster count. Needs a weights row: put "
-                    '"Weight" in column A directly above the first month, and each fund\'s share '
-                    "of the portfolio in its own column. Leave a fund blank to measure it as a "
-                    "candidate the portfolio does not yet hold."),
+                    '"Weight" - or "Current Position", "Allocation", "Holding", "% of '
+                    'Portfolio" - in column A directly above the first month, and each fund\'s '
+                    "share of the portfolio in its own column. Leave a fund blank to measure it "
+                    "as a candidate the portfolio does not yet hold."),
               foreground="#555555", wraplength=860).grid(
         row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
     labelled_combo(allocation_tab, 1, "Covariance estimator",
